@@ -33,6 +33,7 @@ record→train→deploy loop) as Jupyter notebooks - all CPU-only, no hardware o
 | 12 | [`12_domain_randomization.py`](12_domain_randomization.py) | `randomize` + `set_obs_noise` (sim2real appearance/physics/sensor noise) | No | No |
 | 13 | [`13_physics_introspection.py`](13_physics_introspection.py) | `get_jacobian` / `get_mass_matrix` / `inverse_dynamics` / `get_energy` | No | No |
 | 14 | [`14_save_state_and_perturb.py`](14_save_state_and_perturb.py) | `save_state`/`load_state` + `apply_force` + `raycast` | No | No |
+| 15 | [`15_robot_catalog.py`](15_robot_catalog.py) | `list_robots` / `get_robot` registry discovery (no sim) | No | No |
 | -- | [`vla_g1_workflow.py`](vla_g1_workflow.py) | VLA-on-G1: record -> GR00T fine-tune -> WBC deploy | No | Optional (tune) |
 | — | [`vera_mimicgen_panda/`](vera_mimicgen_panda/) | VERA MimicGen → Panda (eef-delta + IK bridge) | No | **Yes** (server) |
 | -- | [`lerobot_hardware_catalog.py`](lerobot_hardware_catalog.py) | `Robot()` covers the whole LeRobot hardware catalog (name -> lerobot_type) | No | No |
