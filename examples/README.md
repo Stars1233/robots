@@ -52,6 +52,8 @@ record→train→deploy loop) as Jupyter notebooks - all CPU-only, no hardware o
 | 15 | [`15_robot_catalog.py`](15_robot_catalog.py) | `list_robots` / `get_robot` registry discovery (no sim) | No | No |
 | -- | [`locomotion/vla_g1_workflow.py`](locomotion/vla_g1_workflow.py) | VLA-on-G1: record -> GR00T fine-tune -> WBC deploy | No | Optional (tune) |
 | — | [`vera_mimicgen_panda/`](vera_mimicgen_panda/) | VERA MimicGen → Panda (eef-delta + IK bridge) | No | **Yes** (server) |
+| — | [`isaac/isaac_replicator_synthdata.py`](isaac/isaac_replicator_synthdata.py) | `IsaacSimulation` + Omniverse Replicator synthetic-data generation | No | **Yes** (Isaac Sim / RTX) |
+| — | [`isaac_gs/`](isaac_gs/) | Isaac RTX robot z-composited over a 3DGS / panorama backdrop (digital-twin) | No | **Yes** (Isaac Sim / RTX) |
 | -- | [`registry/lerobot_hardware_catalog.py`](registry/lerobot_hardware_catalog.py) | `Robot()` covers the whole LeRobot hardware catalog (name -> lerobot_type) | No | No |
 
 ## What each example shows vs raw lerobot
