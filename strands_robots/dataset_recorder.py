@@ -118,7 +118,7 @@ _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def sync_dataset_to_bucket(
-    local_root: str,
+    root: str | Path,
     bucket: str,
     run_id: str | None = None,
     *,
@@ -130,7 +130,9 @@ def sync_dataset_to_bucket(
 
     Lifecycle-independent: needs only a finalized dataset directory on disk
     (``meta/`` present) and the ``hf`` CLI - no live
-    :class:`DatasetRecorder`, no sim world. Both
+    :class:`DatasetRecorder`, no sim world. Covers syncing a dataset
+    recorded earlier in the process, one recorded on hardware via
+    ``lerobot-record``, or a daily re-sync of a directory that grew. Both
     :meth:`DatasetRecorder.sync_to_bucket` and the idle-path bucket sync in
     ``stop_recording`` delegate here so input validation and CLI
     orchestration exist exactly once.
@@ -153,17 +155,20 @@ def sync_dataset_to_bucket(
     ship or downstream loses normalization stats.
 
     Args:
-        local_root: On-disk dataset root (must contain ``meta/``).
+        root: Local dataset directory, ``str`` or ``Path`` (must contain
+            ``meta/``).
         bucket: Bucket target, ``"name"`` or ``"org/name"``.
         run_id: Subpath inside the bucket; defaults to the dataset directory
-            name (``Path(local_root).name``).
+            name (``Path(root).name``).
         create: Create the bucket first (pre-existing bucket is not an error).
-        private: Create the bucket as private.
-        delete: Forward ``--delete`` to ``hf sync`` (mirror-remove).
+        private: Create the bucket as private (only used with ``create=True``).
+        delete: Forward ``--delete`` to ``hf sync`` (mirror semantics -
+            remove remote files absent locally).
 
     Returns:
         ``{"status": "success", "bucket_uri": ...}`` or
-        ``{"status": "error", "message": ...}``.
+        ``{"status": "error", "message": ...}``. Never raises on ``hf``
+        failure; errors are surfaced in the result dict.
     """
     import subprocess
 
@@ -189,6 +194,7 @@ def sync_dataset_to_bucket(
             "or shell metacharacters).",
         }
 
+    local_root = str(root)
     # meta/ must ship or downstream loses normalization stats.
     if not (Path(local_root) / "meta").exists():
         return {
@@ -221,7 +227,7 @@ def sync_dataset_to_bucket(
                 "message": f"bucket create failed: {cp.stderr.strip()}",
             }
 
-    cmd = [hf, "sync", str(local_root), dest]
+    cmd = [hf, "sync", local_root, dest]
     if delete:
         cmd.append("--delete")
     logger.info("Syncing %s -> %s", local_root, dest)
@@ -1203,11 +1209,12 @@ class DatasetRecorder:
     ) -> dict[str, Any]:
         """Sync the on-disk LeRobotDataset into an HF Storage Bucket (Phase 1/2).
 
-        Thin wrapper over the lifecycle-independent
-        :func:`sync_dataset_to_bucket` (which holds the input validation and
-        ``hf`` CLI orchestration), bound to this recorder's dataset root and
-        repo id. On success the recorder's episode/frame counters are added to
-        the payload.
+        Thin delegate to :func:`sync_dataset_to_bucket` (the lifecycle-
+        independent module-level helper, which holds the input validation and
+        ``hf`` CLI orchestration), passing this recorder's dataset root and
+        defaulting ``run_id`` to the dataset name (the last segment of
+        ``repo_id``). On success the result is augmented with this recorder's
+        ``episodes`` and ``frames`` counts.
         """
         result = sync_dataset_to_bucket(
             str(self.dataset.root),

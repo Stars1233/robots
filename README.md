@@ -371,6 +371,20 @@ Requires the `hf` CLI with the `buckets`/`sync` subcommands
 (`pip install -U "huggingface_hub>=1.0"` + `hf auth login` — 0.x releases of
 `huggingface_hub` ship an `hf` entry point without them).
 
+Any on-disk dataset directory can be synced (or daily re-synced) without a live
+recording session — one recorded earlier in the process, or on hardware via
+`lerobot-record`:
+
+```python
+from strands_robots import sync_dataset_to_bucket
+
+sync_dataset_to_bucket("/tmp/demo", "your-org/robot-fave")
+# → {"status": "success", "bucket_uri": "hf://buckets/your-org/robot-fave/demo"}
+```
+
+`run_id` defaults to the directory name; pass `run_id="nightly"` to choose the
+bucket subpath, and `delete=True` for mirror semantics.
+
 **Proprio-only / no video** (e.g. edge devices without a torchcodec wheel):
 `sim.stream_dataset(repo_id, drop_videos=True, delta_timestamps={...})` streams
 state/action only and never touches the video decoder. `drop_videos=True`
