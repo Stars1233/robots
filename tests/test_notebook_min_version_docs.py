@@ -53,3 +53,55 @@ def test_notebooks_readme_states_min_version_for_bucket_path() -> None:
     assert _MIN_VERSION in text, (
         f"{_NOTEBOOKS_README} must note that notebook 5's bucket path needs {_MIN_VERSION!r} (issue #1500)."
     )
+
+
+def _notebook_code() -> str:
+    nb = json.loads(_NOTEBOOK.read_text())
+    return "\n".join("".join(cell["source"]) for cell in nb["cells"] if cell["cell_type"] == "code")
+
+
+def test_streaming_notebook_reads_the_bucket_path_it_wrote() -> None:
+    """The bucket read must target the ``run_id`` folder the sync wrote to.
+
+    ``sync_to_bucket`` uploads to ``hf://buckets/{bucket}/{run_id}``, while
+    ``StreamingLeRobotDataset(repo_type="bucket")`` resolves ``meta/`` and
+    ``data/`` directly under the repo id it is handed. A read of ``BUCKET``
+    alone therefore looks for ``meta/info.json`` at the bucket root and raises
+    ``FileNotFoundError``, because the dataset lives one level down. The two
+    sides are only consistent when the read id carries the same ``run_id``.
+    """
+    code = _notebook_code()
+    assert 'stream_dataset(BUCKET, repo_type="bucket"' not in code, (
+        "notebook streams from BUCKET alone while sync_to_bucket writes to "
+        "hf://buckets/{BUCKET}/{RUN_ID}; the read must include the run_id "
+        "segment or it fails with FileNotFoundError on meta/info.json."
+    )
+    assert 'f"{BUCKET}/{RUN_ID}"' in code, (
+        "notebook must build the bucket repo id from BUCKET and RUN_ID so the "
+        "read targets the same path sync_to_bucket wrote to."
+    )
+    assert "run_id=RUN_ID" in code, (
+        "notebook must pin the sync's run_id to RUN_ID so the write and read sides cannot drift apart."
+    )
+
+
+def test_streaming_notebook_records_at_the_rate_it_rolls_out_at() -> None:
+    """The rollout rate must match the recording fps, or nothing is recorded.
+
+    The recorder writes one frame per control step with no decimation, so
+    ``run_policy`` refuses a rollout whose ``control_frequency`` (50 Hz by
+    default) disagrees with the recording's fps rather than writing frames at a
+    distorted timestamp rate. Without an explicit ``control_frequency``, the
+    30 fps recording here captured zero frames while the cell still printed
+    "recorded ->", and every later cell ran against an empty dataset.
+    """
+    code = _notebook_code()
+    assert "control_frequency=30" in code, (
+        "the recording declares fps=30, so run_policy needs control_frequency=30 "
+        "or the rate guard rejects the rollout and no frames are recorded."
+    )
+    assert 'raise RuntimeError(f"rollout failed' in code, (
+        "the rollout's status must be checked; run_policy reports a rejected "
+        "rollout in its result dict rather than raising, so an unchecked call "
+        "prints success over an empty dataset."
+    )
