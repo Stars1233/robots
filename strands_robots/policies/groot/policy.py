@@ -681,7 +681,8 @@ class Gr00tPolicy(Policy):
         The standard ``gr00t.eval.run_gr00t_server`` registers a ``reset``
         endpoint that maps to ``policy.reset(options=...)`` (see
         ``server_client.py:94``). The default ``Gr00tPolicy.reset`` upstream
-        is a no-op; deployments that need per-episode RNG control should
+        is a no-op, so the forwarded seed does nothing unless the server is
+        patched. Deployments that need per-episode RNG control should
         start the server through the packaged determinism wrapper
         (:mod:`strands_robots.policies.groot.server_wrapper`), which the
         ``gr00t_inference`` container-lifecycle tool mounts for you when
