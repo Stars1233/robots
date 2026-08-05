@@ -271,7 +271,28 @@ def finite_non_negative_error(value: Any, param: str, context: str) -> str | Non
     return None
 
 
-def randomization_seed_error(value: Any, context: str) -> str | None:
+# The largest seed a rollout can apply. ``set_eval_seed`` reseeds the legacy
+# NumPy global RNG (``numpy.random.seed``), which refuses anything above
+# 2**32 - 1 - unlike ``numpy.random.default_rng``, the destination of the
+# ``randomize`` / ``set_obs_noise`` seeds, which accepts an integer of any
+# width. That is why a rollout seed carries a ceiling those two do not: the
+# accepted domain of a parameter is bounded by what its applier can honor, and
+# ``random.seed`` / ``torch.manual_seed`` (the other two RNGs seeded there) are
+# wider still.
+#
+# It lives here, beside the ``max_seed`` parameter it feeds, rather than in
+# ``policy_runner`` with the applier it describes. The note above this module's
+# ``policy_runner`` import is the reason: CodeQL's ``py/unsafe-cyclic-import``
+# walks ``TYPE_CHECKING`` blocks, and ``policy_runner`` imports ``SimEngine``
+# from here under one, so every name added to that module-level import line
+# closes an AST-visible cycle. Adding this constant to it raised
+# ``py/unsafe-cyclic-import`` on all three names that line carries. The rollout
+# side reaches it through the function-local import it already uses for
+# ``randomization_seed_error``, so neither module gains a module-level edge.
+MAX_EVAL_SEED = 2**32 - 1
+
+
+def randomization_seed_error(value: Any, context: str, *, max_seed: int | None = None) -> str | None:
     """Return why a value cannot seed a reproducible randomization stream.
 
     The seed reaches ``numpy.random.default_rng``, which accepts only
@@ -281,9 +302,31 @@ def randomization_seed_error(value: Any, context: str) -> str | None:
     after the configuring call reported success - so it is rejected at the call
     that supplied it.
 
+    Two families share this domain, and they share it because the failure is
+    the same: the ``seed`` of ``randomize`` / ``set_obs_noise``, which drives
+    the domain-randomization streams, and the ``seed`` of a policy rollout or
+    evaluation (``run_policy`` / ``eval_policy`` / ``start_policy`` /
+    ``evaluate_benchmark``), which pins the client RNGs a stochastic policy
+    samples from. The name reads for the first family and is accurate for both:
+    a rollout seed exists precisely to make the policy's randomization
+    reproducible.
+
+    Their appliers are not equally wide, so the accepted domain is not either.
+    ``randomize`` / ``set_obs_noise`` reach ``default_rng``, which takes a
+    non-negative integer of any width. A rollout seed is applied through
+    :func:`~strands_robots.simulation.policy_runner.set_eval_seed`, which also
+    reseeds the legacy NumPy global RNG (``numpy.random.seed``) - the one most
+    policies draw from - and that refuses anything above :data:`MAX_EVAL_SEED`.
+    ``max_seed`` carries that ceiling, so the rollout surfaces refuse a value
+    they could not apply while the randomization surfaces keep the width they
+    can honor. One rule with an explicit bound per destination is what stops
+    the accepted domain drifting from the applier in either direction.
+
     Args:
         value: The candidate seed (``None`` selects fresh entropy).
         context: Method name to prefix the message with.
+        max_seed: Largest value the caller's applier can honor, or ``None``
+            when the non-negative-integer rule is the only bound.
 
     Returns:
         ``None`` when the seed is usable, otherwise the reason as a string.
@@ -294,6 +337,11 @@ def randomization_seed_error(value: Any, context: str) -> str | None:
         return f"{context}: seed must be a non-negative integer or None, got {value!r} (None draws fresh entropy)"
     if int(value) < 0:
         return f"{context}: seed must be a non-negative integer or None, got {value!r} (None draws fresh entropy)"
+    if max_seed is not None and int(value) > max_seed:
+        return (
+            f"{context}: seed must be an integer in [0, {max_seed}] or None, got {value!r} "
+            "(a rollout seed is applied to the legacy NumPy global RNG, which refuses a larger value)"
+        )
     return None
 
 
@@ -1506,6 +1554,47 @@ class SimEngine(ABC):
         return None
 
     @staticmethod
+    def _validate_seed(seed: Any, method: str) -> dict[str, Any] | None:
+        """Reject an unusable RNG seed at the public API.
+
+        A rollout seed is the caller's reproducibility contract: it reseeds the
+        client RNGs (and is forwarded to ``policy.reset``) so the same scene and
+        the same policy replay identically. Only a non-negative integer can do
+        that - the seed ends at ``numpy.random.seed`` / ``default_rng``, which
+        refuses everything else - so a value that cannot be applied is refused
+        at the call that supplied it rather than at the first draw.
+
+        Without this guard the same mistake surfaced three different ways, none
+        of them naming the parameter: ``run_policy`` raised NumPy's own
+        ``TypeError: Cannot cast scalar from dtype('float64') to dtype('int64')``
+        straight out of a method documented to return this envelope,
+        ``start_policy`` reported "started" and failed on its worker thread, and
+        ``True`` was accepted everywhere as a silent seed of ``1``.
+
+        Thin binding of :func:`randomization_seed_error` to this class's
+        tool-error envelope, so a seed refused for ``randomize`` cannot be
+        accepted for the rollout whose reproducibility it is supposed to pin.
+
+        The rollout binding supplies :data:`MAX_EVAL_SEED` as the ceiling. Its
+        applier reseeds the legacy NumPy global RNG as well as ``default_rng``,
+        and that one refuses a larger value - so without the bound a seed in
+        ``[2**32, inf)`` passed this guard and then raised NumPy's own message
+        from inside the rollout, which is the failure this guard exists to
+        replace. ``randomize`` / ``set_obs_noise`` reach only ``default_rng``
+        and keep the unbounded domain they can honor.
+
+        Args:
+            seed: The caller-supplied value (``None`` draws fresh entropy).
+            method: Public method name, used to prefix the error message.
+
+        Returns:
+            An error dict naming the offending parameter, or ``None``.
+        """
+        if error := randomization_seed_error(seed, method, max_seed=MAX_EVAL_SEED):
+            return {"status": "error", "content": [{"text": error}]}
+        return None
+
+    @staticmethod
     def _validate_control_substeps(control_substeps: Any, method: str) -> dict[str, Any] | None:
         """Reject a ``control_substeps`` override the rollout cannot honor.
 
@@ -2186,6 +2275,13 @@ class SimEngine(ABC):
         # and time.sleep(...) downstream, and time.sleep rejects a numpy.float32
         # with a bare "cannot be interpreted as an integer" TypeError.
         control_frequency = float(control_frequency)
+
+        # The seed is the caller's reproducibility contract; an unusable one
+        # cannot be applied at all, and reached NumPy as a bare cast TypeError
+        # out of a method documented to return this envelope. Refused here,
+        # before a policy is built or a frame is written.
+        if err := self._validate_seed(seed, "run_policy"):
+            return err
 
         # accept n_steps (or legacy max_steps) as an alternate horizon
         # specification. duration = n_steps / control_frequency. If both
@@ -3007,6 +3103,14 @@ class SimEngine(ABC):
         ``n_episodes`` default lowered from 10 to 1 (callers opt in to
         longer evals explicitly).
 
+        ``seed`` pins the eval the way it pins a single :meth:`run_policy`
+        rollout: the client RNGs are reseeded once from it and then per episode
+        from a master RNG derived from it, and each per-episode seed is
+        forwarded to ``policy.reset`` so a service-mode policy can reseed its
+        own process. Two evals at the same seed replay identically; ``None``
+        leaves RNG state untouched. Only a non-negative integer can seed those
+        RNGs, so anything else is refused here rather than at the first draw.
+
         ``policy_object`` mirrors :meth:`run_policy`: pass an already-built
         ``Policy`` to skip the ``create_policy`` round-trip (e.g. a loaded
         SmolVLA checkpoint you want to evaluate without re-instantiating).
@@ -3144,6 +3248,8 @@ class SimEngine(ABC):
         if err := self._validate_positive_int(n_episodes, "n_episodes", "eval_policy"):
             return err
         if err := self._validate_positive_int(max_steps, "max_steps", "eval_policy"):
+            return err
+        if err := self._validate_seed(seed, "eval_policy"):
             return err
         if err := self._validate_positive_frequency(control_frequency, "eval_policy"):
             return err
@@ -3348,6 +3454,8 @@ class SimEngine(ABC):
         # start_recording one call earlier. Checked before any policy is
         # built so a rate disagreement costs no weight download and no frame.
         if err := self._validate_recording_rate(control_frequency, "evaluate_benchmark"):
+            return err
+        if err := self._validate_seed(seed, "evaluate_benchmark"):
             return err
         # Coerce to a plain Python float now the value is validated: a NumPy
         # scalar (accepted above via numbers.Real) flows into 1 / control_frequency
