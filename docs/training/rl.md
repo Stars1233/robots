@@ -224,6 +224,26 @@ log-probability in the actor loss the resulting checkpoint holds non-finite
 parameters. Both previously reported success. It is inert when
 `autotune_alpha=False`, which builds no temperature optimizer.
 
+`max_grad_norm` must be a positive number a 64-bit float can represent, checked
+by `validate()` on the on-policy backend only (`clip_grad_norm_` appears in
+`rl/ppo.py` and nowhere else). It is the last thing that touches a gradient
+before the optimizer steps, and `clip_grad_norm_` scales every gradient by
+`max_norm / total_norm` without judging the bound, so two values used to be
+honored silently and wrongly:
+`max_grad_norm=0` scaled every gradient to zero, and the run reported success
+with a checkpoint bit-identical to a never-trained one; a **negative** bound
+negated the scaling ratio, so the update became gradient *ascent* on the loss
+and moved the parameters away from the objective, also under a successful run.
+`True` was a silent bound of one and `"1.0"` was silently coerced, while `nan`,
+`None` and a list raised from inside `torch` mid-update.
+
+`inf` is inside the domain: it is the field's only spelling of *do not clip*, and
+`clip_grad_norm_` honors it by leaving every gradient untouched. A real that no
+64-bit float stands for is refused with the range as its reason rather than the
+sign, and `validate()` reports it like any other unusable bound instead of
+raising: Python integers are arbitrary-precision, so `10**400` is one request
+away.
+
 ## Worked example
 
 `examples/training/train_ppo_reach.py` (on-policy) and `examples/training/train_fastsac_reach.py`
