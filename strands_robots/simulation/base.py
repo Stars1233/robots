@@ -1031,6 +1031,19 @@ class SimEngine(ABC):
         Args:
             robot_name: Which robot to observe. If ``None`` and exactly one
                 robot exists, that robot is used; otherwise returns ``{}``.
+            skip_images: Skip camera rendering and return joint state only.
+                Rendering dominates the per-step cost, so every consumer that
+                reads joint values alone passes ``True`` - the predicate /
+                reward DSL (:mod:`~strands_robots.simulation.predicates`), the
+                LIBERO adapter's state reads, and the ROS 2 bridge when it
+                publishes ``joint_states`` without ``image_raw``. Camera keys
+                are then absent from the result rather than present and empty,
+                so a caller must not read a missing frame as a render failure.
+                A backend overrides a ``True`` here while a dataset recording is
+                active - the recorded frames must carry the camera images the
+                schema declared - so this is a hint, not a guarantee that
+                nothing renders. Defaults to False (render every attached
+                camera).
 
         Returns:
             Observation dict per schema above. Returns ``{}`` if the world
