@@ -11,7 +11,7 @@ protocol, capability-based dispatch, and the signed audit log. Tracked by epic
 | 02 | `02_cross_zone_transport.py` + read-only Rerun fleet dashboard | tracked by [#2181](https://github.com/strands-labs/robots/issues/2181) |
 | 03 | [`03_failover_and_degraded_ops.py`](03_failover_and_degraded_ops.py) - peer-loss reassignment + dispatcher-down safety | here |
 | 04 | [`04_emergency_evacuation.py`](04_emergency_evacuation.py) - three-phase evacuate protocol, benchmark-scored | here |
-| 05 | `05_work_order_dispatch.py` - structured task ingress mapped onto per-site capability manifests | tracked by [#2185](https://github.com/strands-labs/robots/issues/2185) |
+| 05 | [`05_work_order_dispatch.py`](05_work_order_dispatch.py) - structured task ingress mapped onto per-site capability manifests | here |
 
 Shared across the suite:
 
@@ -167,6 +167,43 @@ now ships a read-only `dashboard` role for the fleet dashboard: subscribe to
 presence/health/safety/camera plus its own presence announcement, and no
 `cmd`/`broadcast`/`safety` publish grant - a compromised dashboard cert can
 watch, not actuate.
+
+## 05 - work-order dispatch
+
+Work orders arrive on a JSONL file queue speaking business vocabulary only
+(`{order_id, material, operation, qty, from: "site-a/litho", to:
+"site-a/etch", due}`). The translation to robot vocabulary is two-stage:
+
+1. **Deterministic**: schema validation, then hard-constraint filtering
+   (site, payload, fixture, zones) against the capability manifests. An order
+   no robot can serve is NACKed back onto the queue with a machine-readable
+   reason - never silently dropped.
+2. **Agent**: choosing among the capable robots and sequencing multi-step
+   orders. A choice outside the feasible set is refused (`guard_choice`), so
+   the agent can never invent a capability.
+
+Dispatch goes over the mesh behind a human-in-the-loop gate; the `order_id`
+is threaded through the signed audit log end to end; a structured
+completion/failure event lands back on the queue
+(`work_order_events.jsonl`).
+
+```bash
+# No simulator, no mesh - validate/filter/sequence with a loopback transport:
+STRANDS_MESH_HITL_ACTIONS=none python examples/fleet/05_work_order_dispatch.py --dry-run
+
+# Live: one MuJoCo world (so101 + lekiwi + go2), dispatch over the mesh,
+# interactive HITL approval per dispatch:
+python examples/fleet/05_work_order_dispatch.py
+
+# Signed audit trail:
+STRANDS_MESH_AUDIT_PSK=demo-psk STRANDS_MESH_HITL_ACTIONS=none \
+    python examples/fleet/05_work_order_dispatch.py --dry-run
+```
+
+The example's boundary is the JSON schema, not the transport: a production
+ingress can front the same schema with a queue service or an API. The file
+queue keeps the suite air-gapped (epic decision D1: everything here passes
+with the network off, given cached robot assets).
 
 ## Environment variables
 
