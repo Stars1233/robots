@@ -31,6 +31,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from strands_robots.bus_access import write_action
+from strands_robots.mesh.pacing import Ticker
 from strands_robots.mesh.security import (
     ValidationError,
     input_frame_slew_violation,
@@ -252,10 +253,34 @@ class InputPublisher:
         return self.stats
 
     def _publish_loop(self) -> None:
+        """Read the leader device and publish one input frame per tick.
+
+        Paced by :class:`~strands_robots.mesh.pacing.Ticker`. This loop is one of
+        two that already did the deadline arithmetic by hand -- it measured its own
+        body with ``perf_counter`` and waited ``period - elapsed`` -- so unlike the
+        state, camera and sensor loops it was already achieving its requested rate
+        where the wait itself is honest. Two things change. The subtraction now has
+        ONE owner instead of being duplicated in every loop that needs it, so two
+        copies cannot drift; and the wait it fed is gone, which matters on a host
+        that inflates ``Event.wait`` (see the module docstring) -- there this loop
+        ran at ``1 / (period + penalty)`` no matter how good its arithmetic was.
+        """
         # ``hz`` is validated in __init__, so the division is safe.
         period = 1.0 / float(self.hz)
+        with Ticker(period, self._stop_event) as ticker:
+            self._publish_ticks(ticker)
+
+    def _publish_ticks(self, ticker: Ticker) -> None:
+        """Run the publish loop until stopped, pacing on ``ticker``.
+
+        Split out so :meth:`_publish_loop` owns the ticker's lifetime in a
+        ``finally``: the selector and its self-pipe must be released even when a
+        frame read raises out of the loop.
+
+        Args:
+            ticker: The ticker to pace on, owned by the caller.
+        """
         while self._running and not self._stop_event.is_set():
-            loop_start = time.perf_counter()
             try:
                 action = self.teleoperator.get_action()
                 action_dict = self._normalize_action(action)
@@ -306,10 +331,8 @@ class InputPublisher:
                 if self._error_count <= _MAX_LOGGED_LOOP_ERRORS:
                     logger.warning("[mesh] input publish error (%s): %s", self.device_name, exc)
 
-            elapsed = time.perf_counter() - loop_start
-            sleep_time = period - elapsed
-            if sleep_time > 0:
-                self._stop_event.wait(sleep_time)
+            if ticker.wait():
+                break
 
     @staticmethod
     def _normalize_action(action: Any) -> dict[str, float]:
