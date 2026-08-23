@@ -403,9 +403,12 @@ def load_mjcf(path: str) -> ProceduralRobot:
 
     model_name = root.get("model", os.path.splitext(os.path.basename(path))[0])
 
-    declares_worldbody, top_bodies = _mjcf_model_worldbody_bodies(root, os.path.dirname(os.path.abspath(path)))
+    mjcf_dir = os.path.dirname(os.path.abspath(path))
+    declares_worldbody, top_bodies = _mjcf_model_worldbody_bodies(root, mjcf_dir)
     if not declares_worldbody:
         raise ValueError(f"MJCF loader: {path} has no <worldbody>")
+
+    geom_defaults = _mjcf_geom_defaults(root, mjcf_dir)
 
     bodies: list[BodyDef] = []
     joints: list[JointDef] = []
@@ -422,7 +425,11 @@ def load_mjcf(path: str) -> ProceduralRobot:
         )
     )
 
-    def _walk(body_el: ET.Element, parent_idx: int) -> None:
+    def _walk(body_el: ET.Element, parent_idx: int, childclass: str) -> None:
+        # ``childclass`` is MJCF's per-subtree default class: it applies to every
+        # descendant that does not name a class of its own, and a nested body
+        # overrides it for its own subtree.
+        childclass = body_el.get("childclass") or childclass
         body_name = body_el.get("name") or f"body_{len(bodies)}"
         position = _parse_xyz(body_el.get("pos"))
 
@@ -434,7 +441,7 @@ def load_mjcf(path: str) -> ProceduralRobot:
             mass = _safe_float(inertial.get("mass"), 1.0)
 
         # Geometry - first <geom> primitive type.
-        shape, shape_size = _extract_mjcf_shape(body_el)
+        shape, shape_size = _extract_mjcf_shape(body_el, geom_defaults, childclass)
 
         bodies.append(
             BodyDef(
@@ -488,20 +495,32 @@ def load_mjcf(path: str) -> ProceduralRobot:
             )
 
         for child in body_el.findall("body"):
-            _walk(child, body_idx)
+            _walk(child, body_idx, childclass)
 
     if not top_bodies:
         raise ValueError(f"MJCF loader: {path} <worldbody> has no <body> children (phantom robot guard)")
 
+    # Each top-level body inherits its OWN <worldbody>'s childclass: a spliced
+    # model may carry several, and they need not name the same class.
+    body_childclass = {
+        id(body): wb.get("childclass") or ""
+        for wb in _mjcf_model_toplevel(root, mjcf_dir)
+        if wb.tag == "worldbody"
+        for body in wb.findall("body")
+    }
     for body_el in top_bodies:
-        _walk(body_el, parent_idx=0)
+        _walk(body_el, parent_idx=0, childclass=body_childclass.get(id(body_el), ""))
 
     robot = ProceduralRobot(name=model_name, bodies=bodies, joints=joints)
     _validate_kinematic_tree(robot)
     return robot
 
 
-def _extract_mjcf_shape(body_el: ET.Element) -> tuple[str, tuple[float, ...]]:
+def _extract_mjcf_shape(
+    body_el: ET.Element,
+    defaults: dict[str, dict[str, str]],
+    childclass: str,
+) -> tuple[str, tuple[float, ...]]:
     """Best-effort MJCF body -> (shape, shape_size) extraction from first <geom>.
 
     A capsule or cylinder may spell its axis extent with ``fromto`` instead of
@@ -518,12 +537,18 @@ def _extract_mjcf_shape(body_el: ET.Element) -> tuple[str, tuple[float, ...]]:
     rotated-box bound; those keep their existing default-box reading, matching
     the exclusion :func:`_geom_aabb` documents rather than asserting an
     approximation this does not compute.
+
+    All three attributes are read through :func:`_geom_attrs`, because a geom
+    need not spell any of them itself - ``<default>`` inheritance may supply
+    them, and a link whose class declares ``type="capsule"`` reads as the
+    fallback box if the element is asked directly.
     """
     geom = body_el.find("geom")
     if geom is None:
         return "box", (0.05, 0.05, 0.05)
-    gtype = geom.get("type", "box")
-    size_str = geom.get("size", "")
+    attrs = _geom_attrs(geom, defaults, childclass)
+    gtype = attrs.get("type", "box")
+    size_str = attrs.get("size", "")
     sizes: list[float] = []
     if size_str:
         try:
@@ -542,7 +567,7 @@ def _extract_mjcf_shape(body_el: ET.Element) -> tuple[str, tuple[float, ...]]:
         # MJCF size for capsule/cylinder is (radius, half-length) - but only
         # for the ``pos`` spelling. With ``fromto`` the endpoints carry the
         # length and ``size`` holds only the radius, so read them first.
-        segment = _parse_fromto(geom.get("fromto"))
+        segment = _parse_fromto(attrs.get("fromto"))
         if segment is not None:
             length = _segment_length(segment[0], segment[1])
             if length > 0.0:
@@ -915,6 +940,68 @@ def _mjcf_model_toplevel(root: ET.Element, base_dir: str, _seen: frozenset[str] 
     return out
 
 
+def _mjcf_geom_defaults(root: ET.Element, base_dir: str) -> dict[str, dict[str, str]]:
+    """Every ``<default>`` class's effective ``<geom>`` attributes, flattened.
+
+    MJCF's ``<default>`` elements form a tree: the unnamed top-level element is
+    the root class, a ``<default class="X">`` inherits its enclosing element's
+    attributes, and a ``<geom>`` takes its class's attributes for every
+    attribute it does not spell itself. So ``type``, ``size`` and ``fromto`` -
+    the three attributes that decide what shape a geom is - need not appear on
+    the geom at all. Read as the geom's own attributes alone, a link whose class
+    declares ``type="capsule" size="0.05"`` reports the default box however long
+    its ``fromto`` segment is, which also makes the endpoint reading
+    :func:`_extract_mjcf_shape` performs unreachable for it.
+
+    ``<default>`` is a top-level element, so it is model-global: the fragment
+    declaring a class need not be the fragment declaring the geom, and neither
+    need be the top file - the same splice :func:`_mjcf_model_toplevel` resolves
+    for ``<compiler>`` and ``<asset>``.
+
+    Returns a mapping from class name to that class's merged ``<geom>``
+    attributes, with the root class under ``""``. A class a geom names but no
+    ``<default>`` declares contributes nothing rather than failing the load:
+    MuJoCo refuses such a model itself, and naming the offending class is its
+    report to make.
+    """
+
+    def _geom_attrs_of(default_el: ET.Element) -> dict[str, str]:
+        geom_el = default_el.find("geom")
+        if geom_el is None:
+            return {}
+        return {k: v for k, v in geom_el.attrib.items() if k != "class"}
+
+    classes: dict[str, dict[str, str]] = {"": {}}
+
+    def _flatten(default_el: ET.Element, inherited: dict[str, str]) -> None:
+        merged = {**inherited, **_geom_attrs_of(default_el)}
+        classes[default_el.get("class", "")] = merged
+        for nested in default_el.findall("default"):
+            _flatten(nested, merged)
+
+    # A compilable model has exactly one top-level ``<default>`` - MuJoCo
+    # refuses a second ("top-level default class 'main' cannot be renamed") - so
+    # every class reachable from a spliced fragment is a descendant of one root,
+    # and a plain recursion from each is the whole tree.
+    for el in _mjcf_model_toplevel(root, base_dir):
+        if el.tag == "default":
+            _flatten(el, {})
+    return classes
+
+
+def _geom_attrs(geom: ET.Element, defaults: dict[str, dict[str, str]], childclass: str) -> dict[str, str]:
+    """A geom's effective attributes: its default class's, overridden by its own.
+
+    The class is the geom's own ``class``, else the nearest enclosing body's
+    ``childclass``, else the root class - MJCF's own precedence. Every geom
+    attribute this module reads goes through here so one rule answers "what did
+    this geom declare", rather than each reader asking the element directly and
+    seeing only half of it.
+    """
+    cls = geom.get("class") or childclass
+    return {**defaults.get(cls, {}), **geom.attrib}
+
+
 def _mjcf_model_worldbody_bodies(root: ET.Element, base_dir: str) -> tuple[bool, list[ET.Element]]:
     """Whether the model declares a ``<worldbody>``, and its top-level bodies.
 
@@ -995,6 +1082,8 @@ def _parse_mjcf_mesh_assets(root: ET.Element, mjcf_dir: str) -> dict[str, tuple[
 
 def _find_body_mesh(
     body_el: ET.Element,
+    defaults: dict[str, dict[str, str]],
+    childclass: str,
     offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> tuple[str, tuple[float, float, float], tuple[float, float, float, float], bool] | None:
     """First mesh geom in a body subtree: ``(mesh name, body-frame pos, quat, is_visual)``.
@@ -1008,16 +1097,23 @@ def _find_body_mesh(
     rotations are not composed - LIBERO's compiled object bodies do not
     rotate their nested visual bodies). Returns ``None`` when the subtree
     declares no mesh geom.
+
+    ``mesh``, ``pos``, ``quat`` and the ``group`` that decides visual-vs-
+    collision are read through :func:`_geom_attrs`, so a geom that inherits its
+    group from a ``<default class="visual">`` is preferred as MuJoCo reads it
+    rather than being taken for a collision geom.
     """
     first_any: tuple[str, tuple[float, float, float], tuple[float, float, float, float], bool] | None = None
+    childclass = body_el.get("childclass") or childclass
     for geom in body_el.findall("geom"):
-        mesh_name = geom.get("mesh")
+        attrs = _geom_attrs(geom, defaults, childclass)
+        mesh_name = attrs.get("mesh")
         if not mesh_name:
             continue
-        gpos = _parse_xyz(geom.get("pos"))
+        gpos = _parse_xyz(attrs.get("pos"))
         pos = (offset[0] + gpos[0], offset[1] + gpos[1], offset[2] + gpos[2])
-        quat = _parse_quat(geom.get("quat"))
-        is_visual = (geom.get("group") or "0") != "0"
+        quat = _parse_quat(attrs.get("quat"))
+        is_visual = (attrs.get("group") or "0") != "0"
         if is_visual:
             return (mesh_name, pos, quat, True)
         if first_any is None:
@@ -1025,7 +1121,7 @@ def _find_body_mesh(
     for child in body_el.findall("body"):
         child_off = _parse_xyz(child.get("pos"))
         new_off = (offset[0] + child_off[0], offset[1] + child_off[1], offset[2] + child_off[2])
-        found = _find_body_mesh(child, new_off)
+        found = _find_body_mesh(child, defaults, childclass, new_off)
         if found is not None:
             if found[3]:
                 return found
@@ -1104,7 +1200,11 @@ def _segment_aabb(
     return center, half  # type: ignore[return-value]
 
 
-def _geom_aabb(geom: ET.Element) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
+def _geom_aabb(
+    geom: ET.Element,
+    defaults: dict[str, dict[str, str]],
+    childclass: str,
+) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
     """Return ``(center, half_extent)`` AABB for a collision ``<geom>``.
 
     Handles MuJoCo's analytic primitives (box / sphere / cylinder /
@@ -1124,10 +1224,15 @@ def _geom_aabb(geom: ET.Element) -> tuple[tuple[float, float, float], tuple[floa
     by copying the first ``size`` component and needs the rotated-box bound;
     those keep returning ``None`` (no analytic AABB) so the caller falls back
     rather than asserting an approximation this does not compute.
+
+    ``type``, ``pos``, ``size`` and ``fromto`` are read through
+    :func:`_geom_attrs`: MJCF's ``<default>`` classes may supply any of them, so
+    asking the element directly sees only the half the geom spells itself.
     """
-    gtype = geom.get("type", "sphere")
-    pos = _parse_xyz(geom.get("pos"))
-    size_str = geom.get("size", "")
+    attrs = _geom_attrs(geom, defaults, childclass)
+    gtype = attrs.get("type", "sphere")
+    pos = _parse_xyz(attrs.get("pos"))
+    size_str = attrs.get("size", "")
     try:
         sizes = [float(p) for p in size_str.replace(",", " ").split()] if size_str else []
     except (ValueError, TypeError):
@@ -1148,7 +1253,7 @@ def _geom_aabb(geom: ET.Element) -> tuple[tuple[float, float, float], tuple[floa
         # MJCF spells these either as ``pos`` + ``size="radius half-length"``
         # along the geom's local z, or as ``fromto`` + ``size="radius"`` with
         # the endpoints carrying the placement and the axis extent.
-        segment = _parse_fromto(geom.get("fromto"))
+        segment = _parse_fromto(attrs.get("fromto"))
         if segment is not None:
             return _segment_aabb(gtype, segment[0], segment[1], sizes[0]) if sizes else None
         if len(sizes) >= 2:
@@ -1173,6 +1278,8 @@ def _geom_aabb(geom: ET.Element) -> tuple[tuple[float, float, float], tuple[floa
 
 def _body_collision_aabb(
     body_el: ET.Element,
+    defaults: dict[str, dict[str, str]],
+    childclass: str,
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
     """Compute the AABB (center, full-size) over a body's own geoms.
 
@@ -1187,9 +1294,10 @@ def _body_collision_aabb(
         maxs = [float("-inf")] * 3
         found = False
         for geom in body_el.findall("geom"):
-            if group_filter is not None and geom.get("group") != group_filter:
+            attrs = _geom_attrs(geom, defaults, childclass)
+            if group_filter is not None and attrs.get("group") != group_filter:
                 continue
-            aabb = _geom_aabb(geom)
+            aabb = _geom_aabb(geom, defaults, childclass)
             if aabb is None:
                 continue
             center, half = aabb
@@ -1208,6 +1316,8 @@ def _recursive_collision_aabb(
     body_el: ET.Element,
     offset: tuple[float, float, float],
     bounds: list[list[float]],
+    defaults: dict[str, dict[str, str]],
+    childclass: str,
 ) -> bool:
     """Fold this body's (and nested bodies') collision AABBs into ``bounds``.
 
@@ -1215,8 +1325,9 @@ def _recursive_collision_aabb(
     running body-frame offset from the top-level object body. Returns
     ``True`` if any analytic geometry was found in this subtree.
     """
+    childclass = body_el.get("childclass") or childclass
     found = False
-    aabb = _body_collision_aabb(body_el)
+    aabb = _body_collision_aabb(body_el, defaults, childclass)
     if aabb is not None:
         center, size = aabb
         for i in range(3):
@@ -1228,7 +1339,7 @@ def _recursive_collision_aabb(
     for child in body_el.findall("body"):
         child_off = _parse_xyz(child.get("pos"))
         new_off = (offset[0] + child_off[0], offset[1] + child_off[1], offset[2] + child_off[2])
-        found = _recursive_collision_aabb(child, new_off, bounds) or found
+        found = _recursive_collision_aabb(child, new_off, bounds, defaults, childclass) or found
     return found
 
 
@@ -1295,6 +1406,15 @@ def load_mjcf_scene_objects(path: str) -> list[SceneObject]:
         raise ValueError(f"MJCF scene loader: {path} has no <worldbody>")
 
     mesh_registry = _parse_mjcf_mesh_assets(root, mjcf_dir)
+    geom_defaults = _mjcf_geom_defaults(root, mjcf_dir)
+    # Each top-level body inherits its OWN <worldbody>'s childclass: a spliced
+    # model may carry several, and they need not name the same class.
+    body_childclass = {
+        id(body): wb.get("childclass") or ""
+        for wb in _mjcf_model_toplevel(root, mjcf_dir)
+        if wb.tag == "worldbody"
+        for body in wb.findall("body")
+    }
 
     objects: list[SceneObject] = []
     for body_el in top_bodies:
@@ -1317,7 +1437,8 @@ def load_mjcf_scene_objects(path: str) -> list[SceneObject]:
         mesh_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
         mesh_pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
         mesh_quat: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
-        mesh_ref = _find_body_mesh(body_el)
+        cc = body_childclass.get(id(body_el), "")
+        mesh_ref = _find_body_mesh(body_el, geom_defaults, cc)
         if mesh_ref is not None:
             mesh_name, mesh_pos, mesh_quat, _is_visual = mesh_ref
             asset = mesh_registry.get(mesh_name)
@@ -1347,7 +1468,7 @@ def load_mjcf_scene_objects(path: str) -> list[SceneObject]:
         # (e.g. ``living_room_table`` -> ``living_room_table_col``), folding
         # nested-body offsets into the AABB.
         bounds = [[float("inf")] * 3, [float("-inf")] * 3]
-        found = _recursive_collision_aabb(body_el, (0.0, 0.0, 0.0), bounds)
+        found = _recursive_collision_aabb(body_el, (0.0, 0.0, 0.0), bounds, geom_defaults, cc)
         mins, maxs = bounds[0], bounds[1]
 
         if found:
