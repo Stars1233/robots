@@ -44,13 +44,18 @@ logger = logging.getLogger(__name__)
 # set is consulted from every verb that can carry a command rather than from
 # publish alone - /navigate_to_pose and /follow_path are ROS 2 actions, and the
 # e-stop / motor-enable surfaces are usually services, so a publish-only gate
-# leaves its most dangerous entries unenforceable. An operator can pre-approve
-# individual surfaces via STRANDS_ROS2_COMMAND_ALLOW (comma-separated) or bypass
-# the gate entirely with BYPASS_TOOL_CONSENT=true.
+# leaves its most dangerous entries unenforceable. /manual_drive covers the
+# DeepRacer's /webserver_pkg/manual_drive, and /vehicle_state and /enable_state
+# cover the /ctrl_pkg/... services that arm it; the arming pair belongs here for
+# the same reason /motor_enable does - it is what makes the vehicle act on a
+# command at all. An operator can pre-approve individual surfaces via
+# STRANDS_ROS2_COMMAND_ALLOW (comma-separated) or bypass the gate entirely with
+# BYPASS_TOOL_CONSENT=true.
 COMMAND_BLOCKLIST = frozenset(
     {
         "/cmd_vel",
         "/cmd_vel_unstamped",
+        "/manual_drive",
         "/joint_command",
         "/joint_trajectory",
         "/joint_trajectory_controller/joint_trajectory",
@@ -59,6 +64,8 @@ COMMAND_BLOCKLIST = frozenset(
         "/motor_enable",
         "/enable_motor",
         "/disable_motor",
+        "/vehicle_state",
+        "/enable_state",
         "/navigate_to_pose",
         "/follow_path",
     }
