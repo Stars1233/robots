@@ -39,6 +39,7 @@ from __future__ import annotations
 import math
 import os
 import xml.etree.ElementTree as ET
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -896,6 +897,274 @@ def _parse_quat(quat_str: str | None) -> tuple[float, float, float, float]:
     return (parts[0], parts[1], parts[2], parts[3])
 
 
+#: MJCF's orientation spellings other than ``quat``. MuJoCo keeps these four in
+#: one "alternative orientation" slot carrying which of them was used, separate
+#: from the ``quat`` attribute, and resolves that slot in preference to ``quat``
+#: when it is set. Two consequences, both measured on mujoco 3.5.0 and 3.12.0:
+#: a ``<default>`` class supplying any of these beats a ``quat`` the element
+#: itself declares, and an inner declaration of one of these replaces an outer
+#: declaration of another rather than sitting beside it.
+_ORIENTATION_ALT_SPELLINGS = ("euler", "axisangle", "xyaxes", "zaxis")
+
+#: MJCF's mutually exclusive orientation spellings, in the order this module
+#: reports them when ONE element declares more than one (MuJoCo refuses that).
+_ORIENTATION_SPELLINGS = ("quat", *_ORIENTATION_ALT_SPELLINGS)
+
+
+def _merge_mjcf_attrs(outer: Mapping[str, str], inner: Mapping[str, str]) -> dict[str, str]:
+    """``inner``'s attributes over ``outer``'s, with MJCF's orientation precedence.
+
+    Every attribute merges by name -- an inner declaration replaces an outer one
+    -- except that the orientation spellings do not share a name. MuJoCo keeps
+    :data:`_ORIENTATION_ALT_SPELLINGS` in one slot, so an inner ``euler``
+    REPLACES an outer ``zaxis`` instead of joining it, and reading both would
+    leave the effective rotation ambiguous. ``quat`` is a plain attribute and
+    merges by name; whether it or a surviving alternative spelling is in effect
+    is :func:`_parse_orientation`'s decision, not this one's.
+
+    Args:
+        outer: The enclosing level's attributes -- a ``<default>`` class's, or
+            the parent class's when flattening a nested one.
+        inner: The narrower level's own attributes.
+
+    Returns:
+        The merged mapping, carrying at most one of the alternative spellings.
+    """
+    merged = {**outer, **inner}
+    if any(inner.get(spelling) for spelling in _ORIENTATION_ALT_SPELLINGS):
+        for spelling in _ORIENTATION_ALT_SPELLINGS:
+            if not inner.get(spelling):
+                merged.pop(spelling, None)
+    return merged
+
+
+def _mjcf_angle_units(elements: list[ET.Element]) -> tuple[float, str]:
+    """The model's angle scale and Euler sequence, from its ``<compiler>`` elements.
+
+    Read from the whole spliced model (the caller passes
+    :func:`_mjcf_model_toplevel`'s result) because MuJoCo treats ``<compiler>``
+    as model-global: a scene whose only ``<compiler>`` sets ``meshdir`` still
+    inherits ``angle="radian"`` from an ``<include>``d robot fragment.
+
+    Where several ``<compiler>`` elements carry the same attribute the last in
+    document order wins, which is MuJoCo's own precedence and the same rule
+    :func:`_parse_mjcf_mesh_assets` applies to ``meshdir``.
+
+    Returns:
+        ``(angle_scale, eulerseq)`` -- the factor converting a declared angle to
+        radians (``1.0`` for ``angle="radian"``, else degrees-to-radians, since
+        MJCF's default is ``degree``) and the Euler axis sequence as declared,
+        case intact - the case selects the composition order for ``euler``.
+        (default ``"xyz"``).
+    """
+    angle = "degree"
+    eulerseq = "xyz"
+    for compiler_el in (el for el in elements if el.tag == "compiler"):
+        declared_angle = compiler_el.get("angle")
+        if declared_angle:
+            angle = declared_angle.strip().lower()
+        declared_seq = compiler_el.get("eulerseq")
+        if declared_seq:
+            eulerseq = declared_seq.strip()
+    return (1.0 if angle == "radian" else math.pi / 180.0, eulerseq)
+
+
+def _quat_about_axis(axis: tuple[float, float, float], angle: float) -> tuple[float, float, float, float]:
+    """Unit quaternion (wxyz) for a rotation of ``angle`` radians about ``axis``."""
+    norm = math.sqrt(axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2])
+    if norm == 0.0:
+        return (1.0, 0.0, 0.0, 0.0)
+    half = angle / 2.0
+    scale = math.sin(half) / norm
+    return (math.cos(half), axis[0] * scale, axis[1] * scale, axis[2] * scale)
+
+
+def _quat_mul(
+    a: tuple[float, float, float, float], b: tuple[float, float, float, float]
+) -> tuple[float, float, float, float]:
+    """Hamilton product of two wxyz quaternions."""
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    return (
+        aw * bw - ax * bx - ay * by - az * bz,
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+    )
+
+
+def _quat_from_basis(
+    x_axis: tuple[float, float, float],
+    y_axis: tuple[float, float, float],
+    z_axis: tuple[float, float, float],
+) -> tuple[float, float, float, float]:
+    """wxyz quaternion for the rotation whose columns are the given unit axes.
+
+    Shepperd's method, branching on the largest diagonal term: the trace-only
+    form degenerates for a rotation near 180 degrees, which is exactly what an
+    ``xyaxes`` flipping two axes declares. This module keeps its own copy rather
+    than importing the Isaac backend's -- ``loaders`` is stdlib-only and
+    :mod:`strands_robots.simulation.isaac.simulation` imports *it*, so the
+    dependency cannot run the other way. The Newton backend and the mesh sensor
+    reader keep their own copies for the same reason.
+    """
+    m00, m01, m02 = x_axis[0], y_axis[0], z_axis[0]
+    m10, m11, m12 = x_axis[1], y_axis[1], z_axis[1]
+    m20, m21, m22 = x_axis[2], y_axis[2], z_axis[2]
+    trace = m00 + m11 + m22
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        return ((s / 4.0), (m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s)
+    if m00 > m11 and m00 > m22:
+        s = math.sqrt(1.0 + m00 - m11 - m22) * 2.0
+        return ((m21 - m12) / s, s / 4.0, (m01 + m10) / s, (m02 + m20) / s)
+    if m11 > m22:
+        s = math.sqrt(1.0 + m11 - m00 - m22) * 2.0
+        return ((m02 - m20) / s, (m01 + m10) / s, s / 4.0, (m12 + m21) / s)
+    s = math.sqrt(1.0 + m22 - m00 - m11) * 2.0
+    return ((m10 - m01) / s, (m02 + m20) / s, (m12 + m21) / s, s / 4.0)
+
+
+def _parse_orientation(
+    attrs: Mapping[str, str],
+    *,
+    own: Mapping[str, str] | None = None,
+    angle_scale: float = math.pi / 180.0,
+    eulerseq: str = "xyz",
+) -> tuple[float, float, float, float]:
+    """The wxyz orientation an MJCF element declares, whichever spelling it uses.
+
+    MJCF gives a body, geom or site five mutually exclusive ways to state one
+    rotation -- ``quat``, ``euler``, ``axisangle``, ``xyaxes`` and ``zaxis`` --
+    and reading only ``quat`` reports identity for the other four, so an object
+    a model rotates is placed unrotated. Each is resolved the way MuJoCo's
+    compiler does:
+
+    * ``quat="w x y z"`` -- taken as written (see the note below).
+    * ``euler="a b c"`` -- three rotations about the axes ``eulerseq`` names,
+      composed about the *moving* axes (intrinsic), with the angles in the
+      units ``<compiler angle>`` declares.
+    * ``axisangle="x y z a"`` -- ``a`` (in the declared units) about the axis,
+      which need not be normalized.
+    * ``xyaxes="x1 y1 z1 x2 y2 z2"`` -- the x axis, then the y axis
+      orthogonalized against it, then z as their cross product.
+    * ``zaxis="x y z"`` -- the minimal rotation taking ``+z`` onto that axis.
+
+    They are mutually exclusive on ONE element, but not across MJCF's
+    ``<default>`` precedence: a class may supply one spelling and the element
+    declare another, and MuJoCo compiles that model. It resolves it by keeping
+    :data:`_ORIENTATION_ALT_SPELLINGS` in a slot separate from ``quat`` and
+    preferring that slot, so an alternative spelling from ANY level beats a
+    ``quat`` from any level -- including a class ``euler`` over the element's own
+    ``quat``. :func:`_merge_mjcf_attrs` has already resolved which alternative
+    spelling survives, so at most one reaches here.
+
+    A ``quat`` is reported as written rather than normalized. MuJoCo normalizes
+    it, but no ``quat`` in the shipped asset corpus is unnormalized, so
+    normalizing here would only move output for input no shipped model
+    contains; that is a separate contract from reading the spelling at all.
+
+    Args:
+        attrs: The element's effective attributes -- ``el.attrib``, or
+            :func:`_class_attrs`' result where a ``<default>`` class may supply
+            the orientation.
+        own: The element's OWN attributes when ``attrs`` merges a class's in.
+            Only the spellings an element declares itself are mutually
+            exclusive, so this is what the refusal below is measured against;
+            defaults to ``attrs``, which is correct for a ``<body>`` (MJCF has
+            no ``<body>`` default class, so nothing is merged in).
+        angle_scale: Factor converting a declared angle to radians, from
+            :func:`_mjcf_angle_units`.
+        eulerseq: Euler axis sequence with its case intact, from
+            :func:`_mjcf_angle_units`.
+
+    Returns:
+        The orientation as a wxyz tuple; identity when the element declares no
+        orientation, or when the one it declares is malformed (the historical
+        reading for a malformed ``quat``).
+
+    Raises:
+        ValueError: If ``own`` declares more than one orientation spelling.
+            MuJoCo refuses such a model outright ("multiple orientation
+            specifiers are not allowed"), so there is no rotation to pick. A
+            class supplying one spelling while the element declares another is
+            NOT that case -- MuJoCo compiles it, and it is resolved above.
+    """
+    declared_here = [s for s in _ORIENTATION_SPELLINGS if (attrs if own is None else own).get(s)]
+    if len(declared_here) > 1:
+        raise ValueError(
+            f"MJCF orientation: {declared_here} were all declared on one element, but they are mutually "
+            "exclusive - MuJoCo refuses a model with multiple orientation specifiers. Keep one."
+        )
+    # An alternative spelling beats ``quat`` whichever level declared it, and
+    # ``_merge_mjcf_attrs`` leaves at most one of them, so the first is the one.
+    alternatives = [s for s in _ORIENTATION_ALT_SPELLINGS if attrs.get(s)]
+    if alternatives:
+        spelling = alternatives[0]
+    elif attrs.get("quat"):
+        spelling = "quat"
+    else:
+        return (1.0, 0.0, 0.0, 0.0)
+    if spelling == "quat":
+        return _parse_quat(attrs.get("quat"))
+    try:
+        nums = [float(p) for p in str(attrs[spelling]).replace(",", " ").split()]
+    except (ValueError, TypeError):
+        return (1.0, 0.0, 0.0, 0.0)
+
+    axes = {"x": (1.0, 0.0, 0.0), "y": (0.0, 1.0, 0.0), "z": (0.0, 0.0, 1.0)}
+    if spelling == "euler":
+        sequence = eulerseq.lower()
+        if len(nums) != 3 or len(sequence) != 3 or any(c not in axes for c in sequence):
+            return (1.0, 0.0, 0.0, 0.0)
+        # An upper-case sequence rotates about the moving axes, which is the same
+        # three rotations composed in the opposite order (measured over all six
+        # permutations). A mixed-case sequence is read as the fixed-axis form; no
+        # shipped model declares one.
+        steps = list(zip(sequence, nums, strict=True))
+        if eulerseq.isupper():
+            steps.reverse()
+        quat = (1.0, 0.0, 0.0, 0.0)
+        for axis_name, angle in steps:
+            quat = _quat_mul(quat, _quat_about_axis(axes[axis_name], angle * angle_scale))
+        return quat
+    if spelling == "axisangle":
+        if len(nums) != 4:
+            return (1.0, 0.0, 0.0, 0.0)
+        return _quat_about_axis((nums[0], nums[1], nums[2]), nums[3] * angle_scale)
+    if spelling == "zaxis":
+        if len(nums) != 3:
+            return (1.0, 0.0, 0.0, 0.0)
+        norm = math.sqrt(sum(n * n for n in nums))
+        if norm == 0.0:
+            return (1.0, 0.0, 0.0, 0.0)
+        zx, zy, zz = (n / norm for n in nums)
+        # Minimal rotation from +z onto the declared axis. Antipodal (-z) has no
+        # unique minimal rotation; MuJoCo answers a half turn about x.
+        if zz <= -1.0 + 1e-12:
+            return (0.0, 1.0, 0.0, 0.0)
+        return _quat_about_axis((-zy, zx, 0.0), math.acos(max(-1.0, min(1.0, zz))))
+    # xyaxes
+    if len(nums) != 6:
+        return (1.0, 0.0, 0.0, 0.0)
+    xn = math.sqrt(nums[0] ** 2 + nums[1] ** 2 + nums[2] ** 2)
+    if xn == 0.0:
+        return (1.0, 0.0, 0.0, 0.0)
+    x_axis = (nums[0] / xn, nums[1] / xn, nums[2] / xn)
+    dot = nums[3] * x_axis[0] + nums[4] * x_axis[1] + nums[5] * x_axis[2]
+    ortho = (nums[3] - dot * x_axis[0], nums[4] - dot * x_axis[1], nums[5] - dot * x_axis[2])
+    yn = math.sqrt(sum(c * c for c in ortho))
+    if yn == 0.0:
+        return (1.0, 0.0, 0.0, 0.0)
+    y_axis = (ortho[0] / yn, ortho[1] / yn, ortho[2] / yn)
+    z_axis = (
+        x_axis[1] * y_axis[2] - x_axis[2] * y_axis[1],
+        x_axis[2] * y_axis[0] - x_axis[0] * y_axis[2],
+        x_axis[0] * y_axis[1] - x_axis[1] * y_axis[0],
+    )
+    return _quat_from_basis(x_axis, y_axis, z_axis)
+
+
 def _is_skipped_scene_body(name: str) -> bool:
     """True when an MJCF top-level body is the floor or the robot (not an object)."""
     lname = name.lower()
@@ -1006,7 +1275,7 @@ def _mjcf_class_defaults(root: ET.Element, base_dir: str, tag: str) -> dict[str,
     classes: dict[str, dict[str, str]] = {"": {}, _MJCF_ROOT_DEFAULT_CLASS: {}}
 
     def _flatten(default_el: ET.Element, inherited: dict[str, str]) -> dict[str, str]:
-        merged = {**inherited, **_attrs_of(default_el)}
+        merged = _merge_mjcf_attrs(inherited, _attrs_of(default_el))
         classes[default_el.get("class", "")] = merged
         for nested in default_el.findall("default"):
             _flatten(nested, merged)
@@ -1057,7 +1326,7 @@ def _class_attrs(el: ET.Element, defaults: dict[str, dict[str, str]], childclass
     geom's ``type``, which names a shape rather than a degree of freedom.
     """
     cls = el.get("class") or childclass
-    return {**defaults.get(cls, {}), **el.attrib}
+    return _merge_mjcf_attrs(defaults.get(cls, {}), el.attrib)
 
 
 def _mjcf_model_worldbody_bodies(root: ET.Element, base_dir: str) -> tuple[bool, list[ET.Element]]:
@@ -1143,6 +1412,9 @@ def _find_body_mesh(
     defaults: dict[str, dict[str, str]],
     childclass: str,
     offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    *,
+    angle_scale: float = math.pi / 180.0,
+    eulerseq: str = "xyz",
 ) -> tuple[str, tuple[float, float, float], tuple[float, float, float, float], bool] | None:
     """First mesh geom in a body subtree: ``(mesh name, body-frame pos, quat, is_visual)``.
 
@@ -1170,7 +1442,7 @@ def _find_body_mesh(
             continue
         gpos = _parse_xyz(attrs.get("pos"))
         pos = (offset[0] + gpos[0], offset[1] + gpos[1], offset[2] + gpos[2])
-        quat = _parse_quat(attrs.get("quat"))
+        quat = _parse_orientation(attrs, own=geom.attrib, angle_scale=angle_scale, eulerseq=eulerseq)
         is_visual = (attrs.get("group") or "0") != "0"
         if is_visual:
             return (mesh_name, pos, quat, True)
@@ -1179,7 +1451,7 @@ def _find_body_mesh(
     for child in body_el.findall("body"):
         child_off = _parse_xyz(child.get("pos"))
         new_off = (offset[0] + child_off[0], offset[1] + child_off[1], offset[2] + child_off[2])
-        found = _find_body_mesh(child, defaults, childclass, new_off)
+        found = _find_body_mesh(child, defaults, childclass, new_off, angle_scale=angle_scale, eulerseq=eulerseq)
         if found is not None:
             if found[3]:
                 return found
@@ -1473,6 +1745,9 @@ def load_mjcf_scene_objects(path: str) -> list[SceneObject]:
         if wb.tag == "worldbody"
         for body in wb.findall("body")
     }
+    # Model-global, so read from the spliced model: a scene whose own <compiler>
+    # sets only meshdir still inherits angle="radian" from an <include>.
+    angle_scale, eulerseq = _mjcf_angle_units(_mjcf_model_toplevel(root, mjcf_dir))
 
     objects: list[SceneObject] = []
     for body_el in top_bodies:
@@ -1481,7 +1756,7 @@ def load_mjcf_scene_objects(path: str) -> list[SceneObject]:
             continue
 
         body_pos = _parse_xyz(body_el.get("pos"))
-        body_quat = _parse_quat(body_el.get("quat"))
+        body_quat = _parse_orientation(body_el.attrib, angle_scale=angle_scale, eulerseq=eulerseq)
 
         # Movable object? -> has a free joint (``<freejoint>`` or
         # ``<joint type="free">``). Otherwise treat as a static fixture.
@@ -1496,7 +1771,7 @@ def load_mjcf_scene_objects(path: str) -> list[SceneObject]:
         mesh_pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
         mesh_quat: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
         cc = body_childclass.get(id(body_el), "")
-        mesh_ref = _find_body_mesh(body_el, geom_defaults, cc)
+        mesh_ref = _find_body_mesh(body_el, geom_defaults, cc, angle_scale=angle_scale, eulerseq=eulerseq)
         if mesh_ref is not None:
             mesh_name, mesh_pos, mesh_quat, _is_visual = mesh_ref
             asset = mesh_registry.get(mesh_name)
