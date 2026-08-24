@@ -9,7 +9,7 @@ body's ``childclass="main"`` - or by naming no class at all.
 
 Keyed on whichever spelling the file happened to use, the resolver loses every
 geom that arrives by the other one. In one direction that is the gap noted when
-:func:`_mjcf_geom_defaults` landed: an unnamed root plus ``<geom class="main"/>``.
+:func:`_mjcf_class_defaults` landed: an unnamed root plus ``<geom class="main"/>``.
 In the other it is the whole model, and it is what shipped assets actually do -
 Menagerie's ``pal_tiago_dual`` writes ``<default class="main">`` declaring
 ``type="mesh" group="1"`` and gives none of its 46 geoms a ``class``, so 34 of
@@ -210,7 +210,7 @@ class TestTheResolverPublishesBothSpellings:
     @pytest.mark.parametrize("root_open", ["<default>", '<default class="main">'])
     def test_the_root_class_is_registered_under_both_names(self, root_open):
         xml = f'<mujoco model="m">{root_open}<geom type="sphere" size="0.04"/></default></mujoco>'
-        defaults = mod._mjcf_geom_defaults(ET.fromstring(xml), ".")
+        defaults = mod._mjcf_class_defaults(ET.fromstring(xml), ".", "geom")
         assert defaults[""] == defaults["main"], (
             f'the root class differs by spelling: "" -> {defaults[""]}, "main" -> {defaults["main"]}'
         )
@@ -218,7 +218,7 @@ class TestTheResolverPublishesBothSpellings:
         assert defaults[""] == {"type": "sphere", "size": "0.04"}
 
     def test_a_model_with_no_default_reports_both_names_as_empty(self):
-        defaults = mod._mjcf_geom_defaults(ET.fromstring('<mujoco model="m"><worldbody/></mujoco>'), ".")
+        defaults = mod._mjcf_class_defaults(ET.fromstring('<mujoco model="m"><worldbody/></mujoco>'), ".", "geom")
         assert defaults[""] == {}
         assert defaults["main"] == {}
 
@@ -307,7 +307,9 @@ class TestWhatTheAliasMustNotChange:
 
     def test_a_class_a_model_never_declares_still_contributes_nothing(self, tmp_path):
         """``main`` is now always a key, so ``.get`` must still miss other names."""
-        defaults = mod._mjcf_geom_defaults(
-            ET.fromstring('<mujoco model="m"><default><geom type="sphere" size="0.04"/></default></mujoco>'), "."
+        defaults = mod._mjcf_class_defaults(
+            ET.fromstring('<mujoco model="m"><default><geom type="sphere" size="0.04"/></default></mujoco>'),
+            ".",
+            "geom",
         )
         assert "wheel" not in defaults

@@ -35,7 +35,7 @@ import xml.etree.ElementTree as ET
 
 import pytest
 
-from strands_robots.simulation.isaac.loaders import _mjcf_geom_defaults, load_mjcf
+from strands_robots.simulation.isaac.loaders import _mjcf_class_defaults, load_mjcf
 
 mujoco = pytest.importorskip("mujoco")
 
@@ -68,7 +68,7 @@ def _body(path, name):
 
 
 def _resolved_classes(path):
-    return _mjcf_geom_defaults(ET.parse(path).getroot(), str(path.parent))
+    return _mjcf_class_defaults(ET.parse(path).getroot(), str(path.parent), "geom")
 
 
 def _assert_matches_mujoco(path, body_name, geom_name, why):
