@@ -14,9 +14,14 @@ What the driver actually does:
   callback drops into an in-memory cache the mesh reads at its own cadence
   (:mod:`strands_robots.mesh.sensors` publishes ``_imu``, ``_battery``,
   ``_lidar_state`` and ``_lidar_summary`` from those caches).
-* Gates writes on the FSM: :meth:`send_action` refuses when the low-state
-  ``mode_machine`` is outside :data:`~strands_robots.tools.g1.HANDSHAKE_FSMS`
-  or the battery is under the floor.
+* Gates writes on the FSM: :meth:`send_action` refuses when the FSM state
+  is outside :data:`~strands_robots.tools.g1.HANDSHAKE_FSMS` or the battery
+  is under the floor.  The gate consults :attr:`_fsm_id` (the high-level
+  FSM state from the motion-switcher API) rather than :attr:`_mode_machine`
+  (the uint8 hardware-layout id from ``LowState``); those two fields have
+  disjoint value ranges and must not be conflated.  Until the
+  motion-switcher source is wired (harness#361 PR-C, #2765), the gate
+  refuses honestly rather than silently rejecting every real frame.
 * Task and policy paths (``start_task``, ``run_policy``, ``stop_task``,
   ``get_task_status``) return a named "not wired yet" envelope. Locomotion
   and arm actions land here in issue #358; the driver's job in issue #354
@@ -37,7 +42,7 @@ from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING, Any, cast
 
 from strands_robots.tools.g1 import HANDSHAKE_FSMS, WALK_FSMS, decode_code
-from strands_robots.tools.g1._dds_engine import DDSSubscriberSet
+from strands_robots.tools.g1._dds_engine import DDSPublisher, DDSSubscriberSet
 
 if TYPE_CHECKING:
     from strands.types.tools import ToolSpec, ToolUse
@@ -58,6 +63,80 @@ _TOPIC_LOWSTATE = "rt/lowstate"
 _TOPIC_BMS = "rt/lf/bmsstate"
 _TOPIC_LIDAR_STATE = "rt/utlidar/lidar_state"
 _TOPIC_LIDAR_CLOUD = "rt/utlidar/cloud_livox_mid360"
+
+# The topic the driver writes.  ``rt/lowcmd`` carries a full ``LowCmd_`` shaped
+# for the G1 wholebody actuator set - motion cannot go anywhere else without
+# also crossing the FSM handshake, so the write path is a single-topic path.
+_TOPIC_LOWCMD = "rt/lowcmd"
+
+# The G1 wholebody motor slot count.  ``LowCmd_.motor_cmd`` is a fixed-length
+# array of ``MotorCmd_`` (see :mod:`unitree_sdk2py.idl.unitree_hg.msg.dds_`);
+# 35 is the wholebody layout the current firmware ships with, and slot 29
+# (``kNotUsedJoint``) is the arm-SDK enable byte the ``LowCmd_`` protocol
+# reserves - the driver leaves the enable byte at whatever the caller set.
+# _G1_MOTOR_SLOTS was declared here and never read - the ``LowCmd_.motor_cmd``
+# array is fixed by the IDL, so the constant is redundant.  Removed to keep
+# the module surface honest and to close CodeQL's unused-global alert.
+
+# The joint-name -> slot index mapping the driver accepts in
+# :meth:`G1Driver.send_action`.  Kept as a module-level constant so a caller
+# reading the driver's contract can grep the exact names it takes, and so a
+# subclass that adds a joint does not have to rewrite the map.  Names match
+# ``G1JointIndex`` in ``unitree_sdk2_python`` verbatim, but the driver does
+# not import the SDK's class - a name-typo in a caller's action dict must
+# surface here, not from an SDK-load failure on a machine that has no SDK.
+_G1_JOINT_INDEX: dict[str, int] = {
+    # Left leg
+    "left_hip_pitch": 0,
+    "left_hip_roll": 1,
+    "left_hip_yaw": 2,
+    "left_knee": 3,
+    "left_ankle_pitch": 4,
+    "left_ankle_roll": 5,
+    # Right leg
+    "right_hip_pitch": 6,
+    "right_hip_roll": 7,
+    "right_hip_yaw": 8,
+    "right_knee": 9,
+    "right_ankle_pitch": 10,
+    "right_ankle_roll": 11,
+    # Waist
+    "waist_yaw": 12,
+    "waist_roll": 13,
+    "waist_pitch": 14,
+    # Left arm
+    "left_shoulder_pitch": 15,
+    "left_shoulder_roll": 16,
+    "left_shoulder_yaw": 17,
+    "left_elbow": 18,
+    "left_wrist_roll": 19,
+    "left_wrist_pitch": 20,
+    "left_wrist_yaw": 21,
+    # Right arm
+    "right_shoulder_pitch": 22,
+    "right_shoulder_roll": 23,
+    "right_shoulder_yaw": 24,
+    "right_elbow": 25,
+    "right_wrist_roll": 26,
+    "right_wrist_pitch": 27,
+    "right_wrist_yaw": 28,
+}
+
+# The named-joint count, derived from :data:`_G1_JOINT_INDEX` so a joint added
+# later moves both builders together.  ``LowCmd_.motor_cmd`` is a 35-array; the
+# G1 commands 29 joints and slots 29..34 are a reserved tail that neither
+# builder names.  Bound the Enable-byte loop by this count rather than by
+# ``len(cmd.motor_cmd)`` so the stop frame stays byte-identical to the SDK's
+# own G1 reference (``example/g1/low_level/g1_low_level_example.py:135`` loops
+# ``for i in range(G1_NUM_MOTOR)``, where ``G1_NUM_MOTOR = 29``).
+_G1_NAMED_JOINTS: int = max(_G1_JOINT_INDEX.values()) + 1
+
+# PD gain defaults used when a caller does not supply per-joint gains.  These
+# are the gains the neon reference stack uses for a rested-arm hold; they are
+# deliberately conservative and match what the FSM 501 (sitting) hold expects.
+# A caller who cares supplies ``kp``/``kd`` in the action dict.
+_DEFAULT_KP: float = 25.0
+_DEFAULT_KD: float = 0.5
 
 
 class G1Driver:
@@ -123,11 +202,24 @@ class G1Driver:
         self._battery: dict[str, Any] | None = None
         self._lidar_state: dict[str, Any] | None = None
         self._lidar_summary: dict[str, Any] | None = None
+        # ``_mode_machine`` is the uint8 hardware layout id echoed on every
+        # ``LowCmd_`` (``LowState_.mode_machine``, packed ``<2B`` alongside
+        # ``mode_pr`` so the value is bounded to ``[0, 255]``).  ``_fsm_id`` is
+        # the high-level FSM state the arm-SDK / locomotion gates test against
+        # (:data:`HANDSHAKE_FSMS` = {500, 501, 801}, :data:`WALK_FSMS`).  These
+        # are two different fields with two different value ranges - conflating
+        # them raises ``struct.error`` on ``mode_machine=500`` because the CRC
+        # layout packs ``mode_machine`` as ``<B``.  ``_fsm_id`` arrives from
+        # the motion-switcher API rather than ``rt/lowstate``; until that source is wired the gate
+        # refuses with a precise message rather than silently rejecting every
+        # real frame.
+        self._mode_machine: int | None = None
         self._fsm_id: int | None = None
 
         # Populated by :meth:`connect_eagerly`. ``None`` on a machine that
         # never connected - a valid state for tests and imports.
         self._subs: DDSSubscriberSet | None = None
+        self._pubs: DDSPublisher | None = None
         self._connected: bool = False
         self._connect_error: str | None = None
 
@@ -273,6 +365,21 @@ class G1Driver:
             if err is not None:
                 self._connect_error = err
                 return err
+        # Start the publisher on the same interface.  The subscriber set has
+        # already run ``ensure_dds`` once, so :meth:`DDSPublisher.start`
+        # returns ``None`` without a second SDK init - the shared lock keeps
+        # both halves on the same construction lane.
+        pubs = DDSPublisher(self._network_interface)
+        err = pubs.start()
+        if err is not None:
+            # The subscriber set is up; publisher failed.  Roll back so the
+            # driver reports a single connect failure instead of a half-open
+            # state, and so :meth:`cleanup` on the caller's error path drops
+            # the subscribers cleanly.
+            subs.close()
+            self._connect_error = err
+            return err
+        self._pubs = pubs
         self._subs = subs
         self._connected = True
         self._connect_error = None
@@ -297,6 +404,7 @@ class G1Driver:
                         "port": self._port,
                         "network_interface": self._network_interface,
                         "fsm_id": self._fsm_id,
+                        "mode_machine": self._mode_machine,
                         "battery_pct": (self._battery or {}).get("pct"),
                     }
                 }
@@ -314,10 +422,13 @@ class G1Driver:
         logger.debug("%s.stop() no-op (no motion path wired yet)", self._tool_name)
 
     def cleanup(self) -> None:
-        """Release every DDS subscriber. Idempotent."""
+        """Release every DDS subscriber and publisher. Idempotent."""
         if self._subs is not None:
             self._subs.close()
             self._subs = None
+        if self._pubs is not None:
+            self._pubs.close()
+            self._pubs = None
         self._connected = False
 
     # ------------------------------------------------------------------ #
@@ -346,8 +457,18 @@ class G1Driver:
         """
         if not self._connected:
             return _refuse("not connected - call connect_eagerly() first")
+        if self._mode_machine is None:
+            return _refuse("mode_machine unknown - lowstate has not delivered yet")
         if self._fsm_id is None:
-            return _refuse("FSM id unknown - lowstate has not delivered yet")
+            # ``_fsm_id`` arrives from the motion-switcher API rather than
+            # ``rt/lowstate``; ``LowState_.mode_machine`` is uint8 and cannot
+            # host {500, 501, 801}.  Refuse honestly rather than let a real
+            # frame silently reach a gate whose intersection with the echo's
+            # value range is empty.
+            return _refuse(
+                "FSM id unknown - motion-switcher source has not been wired "
+                "(harness#361 PR-C); see #2765 for the wire-side decision"
+            )
         if scope == "arm":
             allowed, kind = HANDSHAKE_FSMS, "arm writes"
         elif scope == "loco":
@@ -367,24 +488,65 @@ class G1Driver:
         action: dict[str, Any],
         robot_name: str | None = None,
     ) -> dict[str, Any]:
-        """Refuse writes today; the FSM and battery gates are already live.
+        """Publish one :class:`LowCmd_` on ``rt/lowcmd`` for the given joints.
 
-        The motion writes to ``rt/armsdk`` and ``rt/lowcmd`` land in issue
-        #358 - but the gates that a real ``send_action`` will consult are
-        cheap to install now, and installing them here means the day the
-        write lines land the gates already have coverage. The envelope
-        matches what a rejected motion call will return.
+        The action dict is keyed by joint name (see :data:`_G1_JOINT_INDEX`
+        for the exact set).  A caller supplies either
 
-        Scope is ``"arm"`` because ``send_action`` in the lerobot driver
-        writes joint targets to the arm SDK; base velocity is not a
-        ``send_action`` verb. When the write lines land they will consult
-        the same :meth:`_check_motion_gates` call and pass the same scope.
+        * ``{joint_name: target_position_radians}`` for the common case where
+          every joint uses the driver's default :data:`_DEFAULT_KP` /
+          :data:`_DEFAULT_KD` gains, or
+        * ``{joint_name: {"q": ..., "kp": ..., "kd": ..., "dq": ..., "tau": ...}}``
+          when a caller wants per-joint control.  Any missing key inside the
+          inner dict falls back to the default gain (``kp``, ``kd``) or zero
+          (``dq``, ``tau``); a missing ``q`` refuses the whole action so a
+          silently-zeroed target cannot make it onto the wire.
+
+        Two things this method is deliberately *not*:
+
+        1. A control loop.  A caller who wants 500 Hz calls this on their own
+           timer; the driver's job here is one wire frame, not a schedule.
+           The loop lands in the follow-up PR that closes issue #361 in full.
+        2. A safety filter.  The FSM and battery gates are the safety
+           envelope; command-magnitude limits are the arm-SDK client's job.
+
+        Scope is ``"arm"`` because ``send_action`` writes to ``rt/lowcmd`` for
+        arm-SDK-shaped targets; base velocity is not a ``send_action`` verb.
+        The scope classification and gate call are unchanged from the previous
+        stub - so the tests that already pinned FSM and battery refusals stay
+        valid.
         """
-        del action, robot_name  # gates run before we would use them
+        del robot_name  # driver fronts one G1
         refusal = self._check_motion_gates("arm")
         if refusal is not None:
             return refusal
-        return _refuse("motion path not wired yet (issue #358)")
+        if self._pubs is None:
+            return _refuse("publisher not initialised - call connect_eagerly() first")
+        cmd, err = _build_lowcmd_from_action(action, mode_machine=self._mode_machine)
+        if err is not None:
+            return _refuse(err)
+        # Lazy import.  A missing SDK on the write path is the same failure
+        # mode the subscriber set already covers; publisher returns a string.
+        try:
+            from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_
+        except ImportError as exc:  # pragma: no cover - exercised on hardware
+            return _refuse(f"unitree_sdk2py is not installed: {exc}")
+        pub_err = self._pubs.publish(_TOPIC_LOWCMD, LowCmd_, cmd)
+        if pub_err is not None:
+            return _refuse(pub_err)
+        return {
+            "status": "success",
+            "content": [
+                {
+                    "json": {
+                        "topic": _TOPIC_LOWCMD,
+                        "joints": sorted(action.keys()),
+                        "fsm_id": self._fsm_id,
+                        "mode_machine": self._mode_machine,
+                    }
+                }
+            ],
+        }
 
     # ------------------------------------------------------------------ #
     # Task and policy paths (stubs until #358).                          #
@@ -488,7 +650,15 @@ class G1Driver:
         ]
 
     def _on_lowstate(self, msg: Any) -> None:
-        """Decode ``rt/lowstate`` into :attr:`_imu` and :attr:`_fsm_id`."""
+        """Decode ``rt/lowstate`` into :attr:`_imu` and :attr:`_mode_machine`.
+
+        ``LowState_.mode_machine`` is the uint8 hardware-layout id the firmware
+        wants echoed on every ``LowCmd_``.  It is **not** the high-level FSM
+        state the arm-SDK gates test against - that value lives behind the
+        motion-switcher API and arrives on a different topic.  Writing this
+        field to :attr:`_mode_machine` (rather than :attr:`_fsm_id`) keeps the
+        two ranges separate: ``[0, 255]`` for the echo, arbitrary for the gate.
+        """
         try:
             imu = getattr(msg, "imu_state", None)
             if imu is not None:
@@ -501,7 +671,7 @@ class G1Driver:
                 }
             mode_machine = getattr(msg, "mode_machine", None)
             if mode_machine is not None:
-                self._fsm_id = int(mode_machine)
+                self._mode_machine = int(mode_machine)
         except Exception as exc:  # noqa: BLE001 - IDL message can be anything
             logger.debug("%s: lowstate decode failed: %s", self._tool_name, exc)
 
@@ -623,3 +793,188 @@ def _resolve_message_class(cls_path: tuple[str, str]) -> Any:
     if not hasattr(module, class_name):
         return f"{module_path} has no {class_name}"
     return getattr(module, class_name)
+
+
+def _build_lowcmd_from_action(
+    action: dict[str, Any],
+    mode_machine: int | None = None,
+) -> tuple[Any, str | None]:
+    """Build a ``LowCmd_`` populated from a caller's ``send_action`` dict.
+
+    Returns ``(cmd, None)`` on success and ``(None, reason)`` when the action
+    dict is unusable.  Kept as a free function so a test can walk the mapping
+    without a driver instance, and so :meth:`G1Driver.send_action` reads as
+    "gate, build, publish" - three verbs in three lines.
+
+    The mapping is:
+
+    * Every joint name in ``action`` must be a key of :data:`_G1_JOINT_INDEX`.
+      An unknown name refuses the whole action - the alternative would be to
+      silently drop a joint the caller thought was commanded, which is the
+      single worst failure mode on a robot.
+    * A scalar value is interpreted as the position target ``q``, with
+      :data:`_DEFAULT_KP` / :data:`_DEFAULT_KD` gains and zero ``dq``/``tau``.
+    * A dict value must contain ``"q"``; ``"kp"``, ``"kd"``, ``"dq"``, ``"tau"``
+      are optional.  An unknown key inside the inner dict is refused for the
+      same reason as an unknown joint name: silent drop is worse than a
+      caller-facing error.
+
+    Wire-frame contract:
+
+    * ``mode_pr = 0`` - PR mode, which is what the joint-name table this
+      helper interprets is calibrated for.  AB mode (``mode_pr = 1``) would
+      silently remap four ankle indices.
+    * ``mode_machine`` is echoed from the live ``LowState`` (the driver
+      caches it at :attr:`G1Driver._mode_machine`, a uint8 in ``[0, 255]``
+      as packed by ``_CRC__packFmtHGLowCmd``).  Firmware drops a frame
+      whose ``mode_machine`` does not match.  This is **not** the same
+      value as :attr:`G1Driver._fsm_id`, which comes from the
+      motion-switcher API and is the arm-SDK gate's admission value.
+    * ``motor_cmd[i].mode = 1`` on every commanded slot - the enable byte.
+      Unset (``0`` = Disable), a frame with a valid CRC still commands
+      nothing.  Slots the caller did not touch stay at ``0``.
+    * ``crc`` is computed by the SDK's own ``CRC().Crc(cmd)`` after every
+      other field is populated.  Firmware silently drops a non-matching
+      frame, so this is the last write before return.
+
+    The SDK import is lazy so this helper is safe to call in a test without
+    the SDK on the box; a missing SDK returns a reason string, matching the
+    driver's other error paths.
+    """
+    if not isinstance(action, dict):
+        return None, f"action must be a dict, got {type(action).__name__}"
+    if not action:
+        return None, "action is empty; nothing to command"
+    try:
+        from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_ as _default_lowcmd
+        from unitree_sdk2py.utils.crc import CRC as _CRC
+    except ImportError as exc:  # pragma: no cover - exercised on hardware
+        return None, f"unitree_sdk2py is not installed: {exc}"
+    cmd = _default_lowcmd()
+    # Wire-frame contract: PR mode, echo mode_machine, enable the touched slots.
+    cmd.mode_pr = 0
+    if mode_machine is not None:
+        cmd.mode_machine = int(mode_machine)
+    known_inner = {"q", "kp", "kd", "dq", "tau"}
+    for name, value in action.items():
+        slot = _G1_JOINT_INDEX.get(name)
+        if slot is None:
+            allowed = ", ".join(sorted(_G1_JOINT_INDEX))
+            return None, f"unknown joint name {name!r}; expected one of: {allowed}"
+        if isinstance(value, dict):
+            unknown_inner = set(value) - known_inner
+            if unknown_inner:
+                return None, (
+                    f"unknown per-joint keys for {name!r}: "
+                    f"{sorted(unknown_inner)}; expected a subset of {sorted(known_inner)}"
+                )
+            if "q" not in value:
+                return None, f"per-joint dict for {name!r} is missing required key 'q'"
+            q = value["q"]
+            kp = value.get("kp", _DEFAULT_KP)
+            kd = value.get("kd", _DEFAULT_KD)
+            dq = value.get("dq", 0.0)
+            tau = value.get("tau", 0.0)
+        else:
+            q, kp, kd, dq, tau = value, _DEFAULT_KP, _DEFAULT_KD, 0.0, 0.0
+        try:
+            q_f = float(q)
+            kp_f = float(kp)
+            kd_f = float(kd)
+            dq_f = float(dq)
+            tau_f = float(tau)
+        except (TypeError, ValueError) as exc:
+            return None, f"joint {name!r} carries a non-numeric target: {exc}"
+        motor = cmd.motor_cmd[slot]
+        motor.mode = 1  # Enable - a Disable slot commands nothing regardless of CRC.
+        motor.q = q_f
+        motor.dq = dq_f
+        motor.tau = tau_f
+        motor.kp = kp_f
+        motor.kd = kd_f
+    # CRC last - firmware drops a non-matching frame silently.
+    cmd.crc = _CRC().Crc(cmd)
+    return cmd, None
+
+
+def _build_zero_torque_lowcmd(
+    mode_machine: int | None = None,
+) -> tuple[Any, str | None]:
+    """Return a ``LowCmd_`` with every motor's gains and effort zeroed.
+
+    A zero-kp/kd/tau motor holds no position and applies no torque - the
+    softest wire frame the SDK protocol accepts.  Used by :meth:`G1Driver.stop`
+    (issue #361 follow-up: the control loop uses the same helper on shutdown).
+
+    Kept as a free function so a test can compare the produced envelope
+    slot-by-slot without a driver instance, and so the ``stop`` and control
+    loop paths share exactly one construction site.
+
+    Wire-frame contract (parity with :func:`_build_lowcmd_from_action`):
+
+    * ``mode_pr = 0`` - PR mode.  Firmware validates the same field on the
+      stop frame as on any other; keep the value consistent.
+    * ``mode_machine`` is echoed from the caller (typically the driver's
+      cached :attr:`G1Driver._mode_machine`, uint8).  Firmware drops a stop
+      frame whose ``mode_machine`` does not match, and a dropped stop is a
+      fall.
+    * ``motor_cmd[i].mode = 1`` (Enable) on every **named** slot (0..28).
+      Slots 29..34 are a reserved tail: no name in :data:`_G1_JOINT_INDEX`
+      maps to them, and the SDK's own G1 reference bounds its Enable loop by
+      ``G1_NUM_MOTOR = 29`` rather than by the array width.  Enabling a
+      reserved slot at zero gains would be a decision this driver does not
+      have the information to make.  A Disable slot with zero gains lets a
+      *named* joint fall freely - the arm-SDK protocol treats Disable as "not
+      controlled at all" regardless of gain.  Enable + zero gains is the
+      softest *controlled* state the protocol expresses on the joints this
+      driver names; that is what a stop wants.
+    * ``crc`` is stamped last so a later populate cannot invalidate it.
+
+    ``mode_machine`` is accepted as an ``int | None`` for signature parity
+    with :func:`_build_lowcmd_from_action`, and the caller is expected to
+    pass the driver's cached uint8 (``[0, 255]``) rather than an FSM id.
+    Values outside that range raise ``struct.error`` inside the SDK CRC
+    packer as a property of the SDK's own ``<2B2x`` pack format, not of this
+    helper; no production path in this driver can reach the raise because
+    ``G1Driver._on_lowstate`` binds ``_mode_machine`` from a uint8 IDL field.
+
+    This helper is defined but not yet wired: ``G1Driver.stop`` and
+    ``stop_task`` currently return refusal envelopes rather than publishing
+    a frame, and no other call site exists.  The 500 Hz control-loop PR
+    (harness#361 PR-C) is where the wiring lands; the helper is defined
+    here so the loop's shutdown path composes on a tested, CRC-correct
+    frame rather than one hand-rolled next to it.
+    """
+    try:
+        from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_ as _default_lowcmd
+        from unitree_sdk2py.utils.crc import CRC as _CRC
+    except ImportError as exc:  # pragma: no cover - exercised on hardware
+        return None, f"unitree_sdk2py is not installed: {exc}"
+    cmd = _default_lowcmd()
+    # Wire-frame contract: PR mode, echo mode_machine, Enable every named slot.
+    cmd.mode_pr = 0
+    if mode_machine is not None:
+        cmd.mode_machine = int(mode_machine)
+    # ``motor_cmd`` is a 35-array; the G1 commands 29 joints, and slots
+    # 29..34 are a reserved tail that no name in ``_G1_JOINT_INDEX`` maps to.
+    # Assert the width so a future SDK change to a shorter array fails here
+    # rather than by silent slice - this is the length check CodeQL 980
+    # asked for, now that ``_G1_NAMED_JOINTS`` documents the distinction.
+    assert len(cmd.motor_cmd) >= _G1_NAMED_JOINTS, (
+        f"LowCmd_.motor_cmd is {len(cmd.motor_cmd)} slots; the driver names "
+        f"{_G1_NAMED_JOINTS} joints and cannot address them all"
+    )
+    for i in range(_G1_NAMED_JOINTS):
+        motor = cmd.motor_cmd[i]
+        motor.mode = 1  # Enable - a Disable slot lets the named joint fall freely.
+        motor.q = 0.0
+        motor.dq = 0.0
+        motor.tau = 0.0
+        motor.kp = 0.0
+        motor.kd = 0.0
+    # Slots [_G1_NAMED_JOINTS, len(cmd.motor_cmd)) stay at SDK defaults
+    # (mode=0, q=0, dq=0, tau=0, kp=0, kd=0) - byte-identical to the SDK
+    # reference's zero-posture frame on those slots.
+    # CRC last - firmware drops a non-matching frame silently.
+    cmd.crc = _CRC().Crc(cmd)
+    return cmd, None
