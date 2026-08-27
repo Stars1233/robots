@@ -349,7 +349,8 @@ class G1Driver:
                                 "description": (
                                     "sensors: return the latest cached IMU/battery/lidar; "
                                     "status: report connection and FSM; "
-                                    "stop: refuse further writes (a no-op today until #358 lands the motion verbs)"
+                                    "stop: halt any running control loop - it publishes a zero-torque "
+                                    "frame on exit - and report whether it joined"
                                 ),
                                 "enum": ["sensors", "status", "stop"],
                                 "default": "sensors",
@@ -369,11 +370,16 @@ class G1Driver:
     ) -> AsyncGenerator[Any, None]:
         """Handle one agent invocation and yield exactly one tool result.
 
-        The three verbs the spec declares are read-only or a no-op; each maps
-        to a dict already computed by the DDS callbacks. Motion belongs to
-        issue #358; this driver refuses ``stop`` in the same envelope shape it
-        will use once the motion path is wired, so a caller writes the same
-        error-checking code either way.
+        The three verbs the spec declares are all agent-safe: ``sensors`` and
+        ``status`` are read-only, and ``stop`` is a controlled stop that
+        delegates to :meth:`stop_task` - it joins any running control loop,
+        the loop publishes a zero-torque frame on the way out, and the
+        returned envelope reports whether the thread actually joined.  The
+        rich motion verb set (``arm``, ``walk``, ``posture``, ``speak``,
+        ``lidar_snapshot``) lands in issue #358 as vendored neon tools that
+        the agent gets in addition to the driver-as-tool; the transport
+        primitive those verbs will call - :meth:`send_action` publishing on
+        ``rt/lowcmd`` - already ships (issue #361).
         """
         del kwargs  # forward-compat only
         del invocation_state
@@ -399,11 +405,16 @@ class G1Driver:
                 "content": [{"json": await self.get_status()}],
             }
         else:  # "stop"
-            await self.stop()
-            envelope = {
-                "status": "success",
-                "content": [{"text": "stop: no motion path wired yet (issue #358)"}],
-            }
+            # Report the halt outcome rather than assert one.  ``stop()`` is
+            # the protocol's shutdown hook and returns ``None``, so an
+            # envelope built beside it can only restate the intent: a policy
+            # that outlasts the join budget - a remote inference call is the
+            # ordinary case - leaves the loop writing frames while the agent
+            # reads ``success``.  ``stop_task`` performs the same halt and
+            # already decides the verdict (``stopped``, ``running`` and the
+            # timeout reason), so the verb returns that envelope rather than
+            # re-deriving it from the loop handle.
+            envelope = self.stop_task()
         yield {"toolUseId": tool_use_id, **envelope}
 
     # ------------------------------------------------------------------ #
@@ -680,10 +691,6 @@ class G1Driver:
                 }
             ],
         }
-
-    # ------------------------------------------------------------------ #
-    # Task and policy paths (stubs until #358).                          #
-    # ------------------------------------------------------------------ #
 
     # ------------------------------------------------------------------ #
     # Task and policy paths.  The 500 Hz control loop lands here.        #
