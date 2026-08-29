@@ -49,6 +49,7 @@ from typing import TYPE_CHECKING, Any, cast
 from strands_robots.mesh.pacing import Ticker
 from strands_robots.tools.g1 import HANDSHAKE_FSMS, WALK_FSMS, decode_code
 from strands_robots.tools.g1._dds_engine import DDSPublisher, DDSSubscriberSet
+from strands_robots.tools.g1._motion_switcher import FSMReading, read_fsm_id
 from strands_robots.utils import (
     finite_number_error,
     positive_count_error,
@@ -76,6 +77,38 @@ _BATTERY_FLOOR_PCT: float = 15.0
 # without patching the sleep call directly.
 _CONTROL_LOOP_HZ: float = 500.0
 _CONTROL_LOOP_DT: float = 1.0 / _CONTROL_LOOP_HZ
+
+# FSM re-read cadence during a rollout, and the staleness bound the per-step
+# gate holds the resulting cache to.
+#
+# Reading the FSM is a ``MotionSwitcherClient.CheckMode()`` request/response
+# round trip over DDS, so it cannot happen on the control-loop thread: at
+# ``_CONTROL_LOOP_DT`` (2 ms) a LAN round trip alone overruns the period the
+# cadence comment above says the firmware validates, and one transient
+# transport failure blocks the loop for the SDK's whole RPC timeout - during
+# which no frame publishes, no ``_stop_event`` is observed and the joints
+# droop.  :class:`_ControlLoop` therefore runs the read on its own thread at
+# ``_FSM_REFRESH_HZ`` and the per-step re-gate consults the cache.
+#
+# The unit that matters for the staleness bound is *missed reads*, not
+# seconds: the gate must keep admitting across the transient ``CheckMode``
+# failures ``_refresh_fsm_id`` deliberately absorbs, and must stop admitting
+# once the reading behind it is no longer evidence about the robot.  Ten
+# consecutive misses is the bound; the seconds follow the cadence, so
+# changing the cadence cannot silently change how many failures are
+# tolerated.  Both are module constants so a test can retune them without
+# patching a sleep.
+_FSM_REFRESH_HZ: float = 10.0
+_FSM_REFRESH_DT: float = 1.0 / _FSM_REFRESH_HZ
+_FSM_STALE_AFTER_READS: int = 10
+_FSM_STALE_AFTER_S: float = _FSM_STALE_AFTER_READS * _FSM_REFRESH_DT
+
+# How long a loop shutdown waits for its FSM refresher thread.  Kept short
+# and separate from the control thread's own join budget: the refresher may
+# be parked in an SDK RPC, and shutdown must not trade the zero-torque frame
+# for that wait.  A refresher that outlives the budget is logged, not waited
+# on - it holds no publisher and cannot reach the wire.
+_FSM_REFRESHER_JOIN_S: float = 0.5
 
 # The topics the driver reads. Kept together so a reader sees the whole
 # subscription set in one place.
@@ -205,6 +238,7 @@ class G1Driver:
         port: str | None = None,
         network_interface: str = "eth0",
         battery_floor_pct: float = _BATTERY_FLOOR_PCT,
+        motion_switcher_client_factory: Callable[[str], Any] | None = None,
         **kwargs: Any,
     ) -> None:
         """Record configuration; :meth:`connect_eagerly` does the DDS work.
@@ -229,6 +263,19 @@ class G1Driver:
             battery_floor_pct: Percentage below which :meth:`send_action`
                 refuses to write. The floor is separate from the FSM gate so
                 a caller can see which check refused.
+            motion_switcher_client_factory: Callable taking the network
+                interface and returning an open ``MotionSwitcherClient``.
+                Injected so a unit test can hand in a recording double
+                without patching the SDK module (mirrors the seam
+                :mod:`strands_robots.tools.g1._motion_switcher` already
+                names: ``read_fsm_id`` accepts any object with a callable
+                ``CheckMode`` attribute, so the factory only has to return
+                that shape).  ``None`` selects the default lazy loader,
+                which imports :class:`MotionSwitcherClient` on first call
+                and opens it against ``network_interface`` -- module-load
+                hygiene preserved.  Kept keyword-only so the factory
+                argument does not silently collide with the positional set
+                the driver-base contract fixes.
             **kwargs: Ignored; accepted so the factory can forward extras
                 without the driver knowing what they are.
 
@@ -275,6 +322,52 @@ class G1Driver:
         # real frame.
         self._mode_machine: int | None = None
         self._fsm_id: int | None = None
+
+        # Motion-switcher wiring for the FSM producer.  The factory is called
+        # exactly once inside :meth:`_refresh_fsm_id` (lazy, on the first
+        # motion-gate check), and its return is cached on
+        # :attr:`_motion_switcher_client`.  A ``None`` factory selects the
+        # default lazy loader that imports and opens the real SDK client
+        # against :attr:`_network_interface`; injecting a factory bypasses
+        # both the import and the DDS bring-up, which is how the unit tests
+        # drive the wire without ``unitree_sdk2py``.  See issue #2765 for the
+        # wire-format decisions this producer answers, and
+        # :mod:`strands_robots.tools.g1._motion_switcher` for the decoder it
+        # feeds.
+        self._motion_switcher_client_factory: Callable[[str], Any] | None = motion_switcher_client_factory
+        self._motion_switcher_client: Any | None = None
+        # One lock over "open the client" and "talk to it".  Both entry paths
+        # that refresh - an agent thread in :meth:`send_action` and the
+        # rollout's own refresher thread - reach
+        # :meth:`_refresh_fsm_id` concurrently, so the check-then-act on
+        # ``_motion_switcher_client`` would otherwise open (and leak) two
+        # clients, and two ``CheckMode()`` calls would interleave on one
+        # request/response client the SDK does not document as thread-safe.
+        # The open and the read are one critical section rather than two
+        # because a client that is being opened is not yet a client that can
+        # be read.  AGENTS.md > Review Learnings (#85): a shared-device lock
+        # is only a guarantee where *every* caller takes it, so
+        # ``_refresh_fsm_id`` is the single door to this client and holds
+        # this lock for its whole body.
+        self._motion_switcher_lock = threading.Lock()
+        # When the last *authoritative* FSM reading landed (``time.monotonic``),
+        # or ``None`` before the first one.  Written only on the OK branch of
+        # :meth:`_refresh_fsm_id`: a refused reading deliberately keeps
+        # ``_fsm_id``, so the timestamp is what separates "kept across a
+        # hiccup" from "kept for so long it is no longer evidence".  Read by
+        # the per-step re-gate; see :data:`_FSM_STALE_AFTER_S`.
+        self._fsm_read_at: float | None = None
+        # ``_last_fsm_reading`` carries the most recent :class:`FSMReading` so
+        # a caller inspecting :meth:`get_status` sees the mode label and the
+        # refusal reason (if any) alongside the integer id -- the two questions
+        # ``FSMReading`` separates.  ``None`` before the first refresh.
+        self._last_fsm_reading: FSMReading | None = None
+        # ``_motion_switcher_open_error`` records the reason the factory
+        # refused (SDK missing, transport failed).  Kept separate from
+        # ``_last_fsm_reading.refusal`` because a client that never opened is
+        # a different question from a client that opened but declined to
+        # report an FSM.  Both surfaces are named in :meth:`get_status`.
+        self._motion_switcher_open_error: str | None = None
 
         # Populated by :meth:`connect_eagerly`. ``None`` on a machine that
         # never connected - a valid state for tests and imports.
@@ -505,6 +598,18 @@ class G1Driver:
                         "fsm_id": self._fsm_id,
                         "mode_machine": self._mode_machine,
                         "battery_pct": (self._battery or {}).get("pct"),
+                        # Motion-switcher wire diagnostics.  ``mode_name`` is
+                        # the label the SDK reports (``""`` when no mode is
+                        # selected, otherwise ``"ai"`` / ``"normal"`` / ...);
+                        # ``fsm_refusal`` names why the last ``CheckMode``
+                        # decode declined, if it did; ``motion_switcher_open_error``
+                        # names why the client itself never opened.  All
+                        # three are ``None`` on the happy path.
+                        "fsm_mode_name": (
+                            self._last_fsm_reading.mode_name if self._last_fsm_reading is not None else None
+                        ),
+                        "fsm_refusal": (self._last_fsm_reading.refusal if self._last_fsm_reading is not None else None),
+                        "motion_switcher_open_error": self._motion_switcher_open_error,
                     }
                 }
             ],
@@ -584,7 +689,143 @@ class G1Driver:
     # Command path.                                                      #
     # ------------------------------------------------------------------ #
 
-    def _check_motion_gates(self, scope: str) -> dict[str, Any] | None:
+    def _open_motion_switcher_client(self) -> Any | None:
+        """Return the cached motion-switcher client, opening it on first call.
+
+        The default factory imports :class:`MotionSwitcherClient` lazily and
+        opens it against :attr:`_network_interface`, so no ``unitree_sdk2py``
+        touch happens until the first motion-gate check.  An injected factory
+        (the test seam) is called the same way; either way the return is
+        cached on :attr:`_motion_switcher_client` so subsequent gates reuse
+        the same open client.
+
+        Failures are recorded on :attr:`_motion_switcher_open_error` rather
+        than raised, so :meth:`_refresh_fsm_id` can turn a missing SDK or a
+        failed ``Init`` into the same "FSM id unknown" gate refusal the
+        driver already ships -- one wire-side blocker, one caller-visible
+        message.
+
+        The caller must hold :attr:`_motion_switcher_lock`.  The ``is not
+        None`` early return below is a check-then-act on shared state, and
+        the SDK's ``Init()`` is not idempotent, so two unguarded callers
+        would open two clients and leak one.  :meth:`_refresh_fsm_id` is the
+        only caller and holds the lock across both the open and the read.
+
+        Returns:
+            The open client, or ``None`` if the factory raised or refused.
+        """
+        if self._motion_switcher_client is not None:
+            return self._motion_switcher_client
+        try:
+            if self._motion_switcher_client_factory is not None:
+                client = self._motion_switcher_client_factory(self._network_interface)
+            else:
+                # Default: lazy-import the SDK and open a client against the
+                # driver's own NIC.  ``ChannelFactoryInitialize`` has already
+                # been called by :class:`DDSSubscriberSet.start` (which
+                # :meth:`connect_eagerly` runs before any motion write), so
+                # opening the client does not double-init the bus.  The
+                # actual argument ``MotionSwitcherClient()`` takes is
+                # ``domain_id`` on the current SDK; the network interface is
+                # bound at ``ChannelFactoryInitialize`` time rather than per
+                # client, so it is not forwarded here.  Kept as a positional
+                # ``()`` call to match the SDK's own example, and to leave
+                # room for a domain-id kwarg if the SDK adds one.
+                import importlib
+
+                module = importlib.import_module("unitree_sdk2py.comm.motion_switcher.motion_switcher_client")
+                client_cls = module.MotionSwitcherClient
+                client = client_cls()
+                # ``Init`` is the SDK's own bring-up hook; every G1 example
+                # calls it right after construction.  A client that never
+                # ran ``Init`` returns ``(status != 0, {})`` from
+                # ``CheckMode``, which decodes to a named refusal in
+                # :func:`read_fsm_id` -- so a missing ``Init`` is a
+                # diagnosable failure, not a silent one.
+                init = getattr(client, "Init", None)
+                if callable(init):
+                    init()
+        except Exception as exc:  # noqa: BLE001 - the SDK's failures are opaque
+            self._motion_switcher_open_error = (
+                f"motion-switcher client could not be opened: {type(exc).__name__}: {exc}"
+            )
+            logger.debug(
+                "%s: motion-switcher factory refused: %s",
+                self._tool_name,
+                self._motion_switcher_open_error,
+            )
+            return None
+        self._motion_switcher_client = client
+        self._motion_switcher_open_error = None
+        return client
+
+    def _refresh_fsm_id(self) -> None:
+        """Update :attr:`_fsm_id` from one ``CheckMode()`` reading.
+
+        Called by the motion-write entry points (:meth:`send_action`,
+        :meth:`start_task`, :meth:`run_policy`) through
+        :meth:`_check_motion_gates`, and at :data:`_FSM_REFRESH_HZ` by
+        :meth:`_ControlLoop._refresh_fsm_loop` while a rollout runs.  Never
+        from the control-loop thread: ``CheckMode()`` is a synchronous DDS
+        round trip and the loop publishes on a 2 ms budget.
+        :func:`read_fsm_id` returns an :class:`FSMReading`; on the OK branch
+        the id is written to :attr:`_fsm_id` (which is what the gate compares
+        against :data:`HANDSHAKE_FSMS` and :data:`WALK_FSMS`), and on every
+        branch the full reading is stashed on :attr:`_last_fsm_reading` so a
+        caller inspecting :meth:`get_status` sees the mode label and the
+        refusal reason.
+
+        A refused reading leaves :attr:`_fsm_id` at its previous value: the
+        gate's ``_fsm_id is None`` refusal still fires on the first refresh
+        that fails, and a transient RPC failure on a later refresh leaves the
+        last-known FSM in place rather than opening a gap in the gate.  That
+        matches the SDK's own example, which caches ``mode_machine`` on
+        first ``LowState`` and does not clear it when a later frame is
+        malformed.
+
+        Both branches are non-raising: an SDK-side failure or a shape
+        ``CheckMode`` never returns is turned into a named refusal in
+        :class:`FSMReading` (or into :attr:`_motion_switcher_open_error` when
+        the client never opened), so the gate reports the reason rather than
+        crashing a control loop mid-step.  Issue #2765 tracks the wire-side
+        decision that the read-shape here is graded against.
+
+        The whole body holds :attr:`_motion_switcher_lock` - see that
+        attribute for why the open and the read are one critical section.
+        The lock is never taken on the control-loop thread, so a refresher
+        parked in an RPC delays another refresher and a concurrent
+        ``send_action``, never frame publication.
+        """
+        with self._motion_switcher_lock:
+            client = self._open_motion_switcher_client()
+            if client is None:
+                # ``_motion_switcher_open_error`` carries the reason; the gate's
+                # ``_fsm_id is None`` refusal fires below.  No reading to stash.
+                return
+            reading = read_fsm_id(client)
+            self._last_fsm_reading = reading
+            if reading.fsm_id is not None:
+                self._fsm_id = reading.fsm_id
+                # Stamp only here.  This is the one branch that produced an
+                # id from the wire, so it is the one branch that renews the
+                # cache's claim to describe the robot now.
+                self._fsm_read_at = time.monotonic()
+            elif reading.mode_name == "" and reading.refusal is None:
+                # Explicit "no motion mode selected" reading (the SDK's own
+                # high-level-released state).  ``fsm_id=None`` is the honest
+                # answer: the gate should refuse until a mode is selected, and a
+                # previous non-None cache from before ``ReleaseMode()`` would
+                # otherwise silently open the gate.  Clear it.
+                self._fsm_id = None
+            # A refused reading (``reading.refusal is not None``) leaves
+            # ``_fsm_id`` unchanged: a transient CheckMode() failure on the tenth
+            # step of a rollout should not clobber the id the previous nine
+            # frames wrote to.  The refusal is on ``_last_fsm_reading`` for
+            # ``get_status`` to surface, and ``_fsm_read_at`` is left where it
+            # was so a run of refusals eventually trips the staleness bound
+            # instead of absorbing failures forever.
+
+    def _check_motion_gates(self, scope: str, *, refresh: bool = True) -> dict[str, Any] | None:
         """Return a refusal envelope if a motion write is not safe, else ``None``.
 
         Two FSM sets are enforced separately because the G1 documents them
@@ -605,11 +846,39 @@ class G1Driver:
         Battery-floor is checked after the FSM because a battery-under-floor
         refusal is the same no matter which write kind was requested, and the
         caller has already been told the FSM if the FSM is the reason.
+
+        Args:
+            scope: The caller's declared kind of write, as above.
+            refresh: Whether to read the FSM from the motion-switcher API
+                before consulting it.  ``True`` (the entry points:
+                :meth:`send_action`, :meth:`start_task`, :meth:`run_policy`)
+                pays one synchronous ``CheckMode()`` round trip for an
+                authoritative admission decision.  ``False`` is for
+                :meth:`_ControlLoop._run`'s per-step re-gate, which runs on
+                a 2 ms budget and must not perform a DDS RPC; it reads the
+                cache the loop's refresher thread maintains and refuses once
+                that cache is older than :data:`_FSM_STALE_AFTER_S`.
         """
         if not self._connected:
             return _refuse("not connected - call connect_eagerly() first")
         if self._mode_machine is None:
             return _refuse("mode_machine unknown - lowstate has not delivered yet")
+        # Refresh the FSM id from the motion-switcher API before consulting
+        # it.  The refresh is idempotent: no client → no reading, refused
+        # reading → previous value kept, OK reading → new value.  See
+        # :meth:`_refresh_fsm_id` for the branch semantics.  Called here (top
+        # of the gate) so every motion write reads the current FSM, and
+        # ordered before the ``_fsm_id is None`` check so a fresh read on
+        # the first gate call flips that refusal on the same call rather
+        # than only on the second.
+        #
+        # ``refresh=False`` skips the round trip for the control loop's
+        # per-step re-gate and substitutes the staleness bound below, so the
+        # loop still stops on an FSM it can no longer see - it just learns
+        # about it from the refresher thread instead of from a blocking RPC
+        # inside its 2 ms step.
+        if refresh:
+            self._refresh_fsm_id()
         if self._fsm_id is None:
             # ``_fsm_id`` arrives from the motion-switcher API rather than
             # ``rt/lowstate``; ``LowState_.mode_machine`` is uint8 and cannot
@@ -628,6 +897,39 @@ class G1Driver:
             kind = "motion writes"
         if self._fsm_id not in allowed:
             return _refuse(f"FSM {self._fsm_id} refuses {kind}; needs one of {sorted(allowed)}")
+        # The staleness bound is asked on every path, not just the loop's
+        # per-step re-gate.  ``_refresh_fsm_id``'s refused-reading branch
+        # deliberately keeps ``_fsm_id`` and deliberately does not stamp
+        # ``_fsm_read_at``, so a run of transient ``CheckMode()`` failures on
+        # the refresher would otherwise let ``send_action`` / ``start_task``
+        # / ``run_policy`` publish on an arbitrarily stale cache while the
+        # loop path refused on the same reading.  Same driver, same age past
+        # the same bound - same verdict.
+        #
+        # ``age is None`` is tolerated: on the entry-point path a caller
+        # reaches here only after ``_refresh_fsm_id()`` returned above, and
+        # the OK branch of that refresh is the only one that both writes
+        # ``_fsm_id`` and stamps ``_fsm_read_at``.  So in production
+        # ``_fsm_id is not None`` implies ``_fsm_read_at is not None``.  The
+        # ``age is None`` branch remains reachable for the cache-only path
+        # (``refresh=False``) exercised by fixtures that assign ``_fsm_id``
+        # directly without going through admission; the loop backstops that
+        # by refusing too on ``age is None`` there.
+        read_at = self._fsm_read_at
+        age = None if read_at is None else time.monotonic() - read_at
+        if not refresh and (age is None or age > _FSM_STALE_AFTER_S):
+            return _refuse(
+                f"FSM {self._fsm_id} last confirmed "
+                f"{'never' if age is None else format(age, '.3f') + 's ago'}, over the "
+                f"{_FSM_STALE_AFTER_S:.3f}s staleness bound "
+                f"({_FSM_STALE_AFTER_READS} missed reads at {_FSM_REFRESH_HZ:.0f} Hz)"
+            )
+        if refresh and age is not None and age > _FSM_STALE_AFTER_S:
+            return _refuse(
+                f"FSM {self._fsm_id} last confirmed {age:.3f}s ago, over the "
+                f"{_FSM_STALE_AFTER_S:.3f}s staleness bound "
+                f"({_FSM_STALE_AFTER_READS} missed reads at {_FSM_REFRESH_HZ:.0f} Hz)"
+            )
         battery_pct = (self._battery or {}).get("pct")
         if battery_pct is not None and battery_pct < self._battery_floor_pct:
             return _refuse(f"battery {battery_pct:.1f}% is under floor {self._battery_floor_pct:.1f}%")
@@ -1326,9 +1628,19 @@ class _ControlLoop:
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
+        # The FSM refresher.  A second thread, not a step of the control
+        # thread, because the read it performs is a synchronous DDS RPC -
+        # see :data:`_FSM_REFRESH_HZ`.
+        self._fsm_thread: threading.Thread | None = None
         # Snapshot fields, all under ``_lock``.
         self._steps: int = 0
         self._refusals: int = 0
+        # How many authoritative FSM readings the refresher landed during
+        # this rollout.  Surfaced in :meth:`_ControlLoop.snapshot` because "the gate is
+        # reading a cache" is only safe while something is filling it, and a
+        # refresher that died silently is otherwise invisible until the
+        # staleness bound trips.
+        self._fsm_reads: int = 0
         self._exit_reason: str | None = None
         self._exit_detail: str | None = None
         self._started_at: float | None = None
@@ -1350,6 +1662,13 @@ class _ControlLoop:
         # runs at every normal exit path because :meth:`G1Driver.stop` and
         # :meth:`G1Driver.cleanup` join the loop before closing ``_pubs``.
         self._thread = threading.Thread(target=self._run, name=f"g1-control-{id(self):x}", daemon=True)
+        # Start the refresher first so the cache the per-step re-gate reads is
+        # already being renewed when the first step runs.  Admission has just
+        # taken an authoritative reading (``run_policy`` gated with
+        # ``refresh=True``), so ``_fsm_read_at`` is fresh either way and the
+        # ordering is about the tail of the rollout, not its head.
+        self._fsm_thread = threading.Thread(target=self._refresh_fsm_loop, name=f"g1-fsm-{id(self):x}", daemon=True)
+        self._fsm_thread.start()
         self._thread.start()
 
     def stop(self, reason: str = "stop_task", timeout: float = 2.0) -> bool:
@@ -1402,7 +1721,86 @@ class _ControlLoop:
                 "exit_reason": self._exit_reason,
                 "exit_detail": self._exit_detail,
                 "hz": _CONTROL_LOOP_HZ,
+                # The re-gate reads a cache; these two say who is filling it
+                # and how often, so a poller can tell "the FSM is fine" from
+                # "nothing has looked at the FSM since admission".
+                "fsm_refresh_hz": _FSM_REFRESH_HZ,
+                "fsm_reads": self._fsm_reads,
             }
+
+    # ------------------------------------------------------------------ #
+    # FSM refresher thread.  Owns the only DDS RPC in the rollout window. #
+    # ------------------------------------------------------------------ #
+
+    def _refresh_fsm_loop(self) -> None:
+        """Re-read the FSM at :data:`_FSM_REFRESH_HZ` until the loop stops.
+
+        This thread exists so :meth:`_ControlLoop._run` never blocks on
+        ``MotionSwitcherClient.CheckMode()``.  It performs the read that the
+        per-step re-gate used to perform inline, at a cadence two orders of
+        magnitude below the control loop's, and the re-gate reads the cache
+        it fills.
+
+        Non-raising by construction: :meth:`G1Driver._refresh_fsm_id` turns
+        every SDK-side failure into a recorded refusal, but the broad
+        ``except`` is kept anyway because an exception escaping this thread
+        would kill the refresher and leave the control loop admitting on a
+        cache nothing renews.  The staleness bound in
+        :meth:`G1Driver._check_motion_gates` is the backstop for that state;
+        this handler is what keeps it from being reached by a bug rather than
+        by the wire.
+        """
+        try:
+            with Ticker(_FSM_REFRESH_DT, self._stop_event) as ticker:
+                while not self._stop_event.is_set():
+                    before = self._driver._fsm_read_at
+                    try:
+                        self._driver._refresh_fsm_id()
+                    except Exception as exc:  # noqa: BLE001 - see docstring
+                        logger.debug(
+                            "%s: FSM refresher absorbed %s: %s",
+                            self._driver._tool_name,
+                            type(exc).__name__,
+                            exc,
+                        )
+                    else:
+                        if self._driver._fsm_read_at != before:
+                            with self._lock:
+                                self._fsm_reads += 1
+                    if ticker.wait():
+                        break
+        except Exception as exc:  # noqa: BLE001 - a dead refresher must be visible
+            logger.warning(
+                "%s: FSM refresher exited early (%s: %s); the per-step re-gate will "
+                "refuse once the cached FSM passes the staleness bound",
+                self._driver._tool_name,
+                type(exc).__name__,
+                exc,
+            )
+
+    def _stop_fsm_refresher(self) -> None:
+        """Signal and briefly join the refresher.  Never blocks on the wire.
+
+        Called from :meth:`_ControlLoop._run`'s ``finally`` *after* the zero-torque frame
+        is published: the refresher may be parked in an SDK RPC, and the
+        stop frame is not something to trade for that wait.  A refresher that
+        outlives :data:`_FSM_REFRESHER_JOIN_S` is logged and abandoned - it is
+        a daemon, it holds no publisher, and the driver-level lock keeps it
+        from interleaving with the next rollout's refresher on the shared
+        client.
+        """
+        self._stop_event.set()
+        thread = self._fsm_thread
+        if thread is None:
+            return
+        thread.join(timeout=_FSM_REFRESHER_JOIN_S)
+        if thread.is_alive():
+            logger.debug(
+                "%s: FSM refresher did not join within %.3fs; it is a daemon and "
+                "holds no publisher, so it is left to finish its in-flight read",
+                self._driver._tool_name,
+                _FSM_REFRESHER_JOIN_S,
+            )
 
     # ------------------------------------------------------------------ #
     # Thread body.  Every branch names an exit reason before it returns. #
@@ -1425,7 +1823,14 @@ class _ControlLoop:
                     # Per-step re-gate.  A gate flip refuses the *step* rather
                     # than the whole task, so an FSM transition out of the
                     # allowed set exits cleanly with a zero-torque frame.
-                    refusal = self._driver._check_motion_gates("motion")
+                    #
+                    # ``refresh=False``: this runs every 2 ms, and the FSM read
+                    # is a synchronous DDS round trip.  The FSM the gate
+                    # compares is the one :meth:`_ControlLoop._refresh_fsm_loop` maintains
+                    # on its own thread, and the gate refuses if that cache
+                    # goes stale - so an FSM transition still ends the rollout,
+                    # within one refresher period rather than within one step.
+                    refusal = self._driver._check_motion_gates("motion", refresh=False)
                     if refusal is not None:
                         detail = _refusal_text(refusal)
                         self._set_exit("gate", detail)
@@ -1502,6 +1907,10 @@ class _ControlLoop:
             # frame the wire cannot carry anyway.
             if publish_reason is None:
                 self._emit_zero_torque()
+            # Ordered after the stop frame on purpose: the refresher can be
+            # parked in an SDK RPC, and the join budget must not delay the
+            # frame that de-energises the joints.
+            self._stop_fsm_refresher()
             with self._lock:
                 self._finished_at = time.monotonic()
             # Stash the terminal snapshot before dropping the reference so a
