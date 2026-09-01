@@ -24,11 +24,18 @@ from strands_robots.dashboard import auth
 
 
 class FakeRequest:
-    # A socket peer is modelled because the first-enrollment gate reads it: with no bootstrap
-    # token set, only the machine itself may enroll the passkey that seals the dashboard. These
-    # cells are the owner at the machine, so the peer is loopback.
-    def __init__(self, headers=None, client_host="127.0.0.1"):
+    """A request as it arrived: over a SCHEME, from a PEER, carrying headers.
+
+    Both are properties of the connection rather than of a header, and both are
+    read -- the origin a ceremony is verified against comes from the scheme, and
+    the first-enrollment gate comes from the socket peer. A stand-in answering
+    only one leaves the other reading a default, so it carries both. These cells
+    are the owner enrolling at the machine, so the peer is loopback.
+    """
+
+    def __init__(self, headers=None, scheme="http", client_host="127.0.0.1"):
         self.headers = headers or {"host": "localhost:8090"}
+        self.url = SimpleNamespace(scheme=scheme)
         self.client = type("C", (), {"host": client_host})()
 
 
@@ -257,8 +264,8 @@ def test_status_warns_on_insecure_context():
 
 
 def test_status_warns_on_unusable_rpid():
-    # https via proxy headers, but the host is an IP: rpId can never work.
-    out = auth.status(FakeRequest({"host": "192.168.1.50:8090", "x-forwarded-proto": "https"}))
+    # Reached over https, but the host is an IP: rpId can never work.
+    out = auth.status(FakeRequest({"host": "192.168.1.50:8090"}, scheme="https"))
     assert out["rpid_usable"] is False
     assert "rpId" in out.get("warning", "")
 
