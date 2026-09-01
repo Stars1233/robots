@@ -95,6 +95,7 @@ def _bare_driver(connected: bool = True) -> ReachyDriver:
     driver = ReachyDriver.__new__(ReachyDriver)
     driver._connected = connected
     driver._cache_lock = threading.Lock()
+    driver._head_yaw_target = None
     driver._joints = None
     driver._pose = None
     driver._imu = None
@@ -295,23 +296,34 @@ def _yaw_keys_one_call_carries(verb: str, kwargs: dict[str, Any]) -> set[str]:
 
 
 class TestNoVerbPromisesACouplingLimitItsOwnActionCannotReach:
-    """Fact family 5: the twist limit is a property of one action, not the robot.
+    """Fact family 5: a verb quoting the twist limit states the terms it applies on.
 
-    ``envelope_error`` compares ``head_yaw - body_yaw``, so it needs both in the
-    same action and an action carrying one member is not refused however far the
-    counterpart is. Which surface should own that missing half is open (#3094);
-    what is not open is what the verbs may claim while it is. A tool description
-    is the only thing the model driving the verb reads, so a limit promised
-    there is a limit the model plans against - and a promise of a refusal that
-    does not happen is worse than no promise, because it moves a real robot.
+    A tool description is the only thing the model driving the verb reads, so a
+    limit promised there is a limit the model plans against - and a promise of a
+    refusal that does not happen is worse than no promise, because it moves a
+    real robot. Which terms a verb owes depends on which member it can send
+    alone, and the two are not the same obligation:
+
+    * A lone ``head_yaw`` is not judged against a counterpart at all - the
+      daemon serves it by turning the body under the head - so a verb that can
+      omit ``body_yaw`` must say the limit applies only when both are sent.
+    * A lone ``body_yaw`` *is* judged, against the head yaw the driver last
+      commanded, so a verb that sends it alone must name that counterpart rather
+      than claim an exemption it does not have.
 
     Derived from the tool specs and from what each verb actually sends, so
-    re-adding the unqualified sentence fails here rather than shipping.
+    re-adding an unqualified sentence - or keeping a stale exemption - fails here
+    rather than shipping.
     """
 
-    #: Either phrasing states the condition. The wording stays the author's;
-    #: only the presence of a stated condition is graded.
+    #: Either phrasing states the condition on a path where the limit is not
+    #: applied. The wording stays the author's; only the presence of a stated
+    #: condition is graded.
     SCOPE_PHRASES: tuple[str, ...] = ("only when", "not checked")
+
+    #: What a verb sending a lone ``body_yaw`` must name instead: the head yaw
+    #: the limit is measured against, since for that member it is measured.
+    COUNTERPART_PHRASES: tuple[str, ...] = ("yaw target", "head's own yaw")
 
     @pytest.mark.parametrize("verb", sorted(reachy_actions._ACTIONS))
     def test_a_verb_that_can_send_one_member_states_the_condition(self, verb: str) -> None:
@@ -322,10 +334,29 @@ class TestNoVerbPromisesACouplingLimitItsOwnActionCannotReach:
         yaw_keys = _yaw_keys_one_call_carries(verb, VERB_ARGS[verb])
         if yaw_keys == {"head_yaw", "body_yaw"}:
             return  # every call carries the pair, so the limit does apply
+        if yaw_keys == {"body_yaw"}:
+            assert any(phrase in description for phrase in self.COUNTERPART_PHRASES), (
+                f"{verb} sends body_yaw alone, where the {limit} coupling limit is applied "
+                "against the head yaw target, and quotes the limit without naming it"
+            )
+            return
         assert any(phrase in description for phrase in self.SCOPE_PHRASES), (
             f"{verb} sends {sorted(yaw_keys) or 'no yaw key'} in one action and quotes the "
             f"{limit} coupling limit without stating when it applies"
         )
+
+    def test_the_two_obligations_land_on_different_verbs(self) -> None:
+        """The premise the branch above rests on, measured from the verbs.
+
+        Without this, a single obligation applied to both would pass by accident
+        if the two verbs happened to share a phrase.
+        """
+        lone = {
+            verb: _yaw_keys_one_call_carries(verb, VERB_ARGS[verb])
+            for verb in reachy_actions._ACTIONS
+            if len(_yaw_keys_one_call_carries(verb, VERB_ARGS[verb])) == 1
+        }
+        assert lone == {"reachy_look": {"head_yaw"}, "reachy_body_turn": {"body_yaw"}}
 
     def test_the_two_verbs_that_can_send_a_lone_member_are_the_documented_pair(self) -> None:
         """The premise the rows above rest on, measured from the verbs."""
