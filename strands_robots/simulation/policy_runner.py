@@ -47,7 +47,7 @@ import numpy as np
 
 from strands_robots._async_utils import _resolve_coroutine
 from strands_robots.dataset_recorder import RecordingFrameError
-from strands_robots.policies.base import iter_policy_tree, resolve_chunk_length
+from strands_robots.policies.base import collect_required_bodies, resolve_chunk_length
 from strands_robots.utils import (
     non_negative_whole_number_error,
     positive_count_error,
@@ -931,9 +931,12 @@ class PolicyRunner:
         here - with the available body names - rather than 300 steps of a
         silently absent key that the policy reads as a zero pose.
 
-        The declaration is collected over the whole policy tree
-        (:func:`~strands_robots.policies.base.iter_policy_tree`), not off the
-        object this runner was handed. A wrapper is a different object than the
+        The declaration is collected over the whole policy tree by
+        :func:`~strands_robots.policies.base.collect_required_bodies`, not off
+        the object this runner was handed. That function owns the walk and the
+        ``TypeError`` refusals documented below, and the remote-inference
+        handshake reads the same owner, so what a tree declares cannot depend on
+        which surface asked. A wrapper is a different object than the
         policy inside it, so reading the attribute off the wrapper reports a
         child's declaration as absent - which is the case
         :attr:`~strands_robots.policies.base.Policy.children` exists to answer,
@@ -971,27 +974,12 @@ class PolicyRunner:
                 everywhere else: ``PolicyRunner`` is drivable directly and a
                 direct caller has no envelope to read a refusal from.
         """
-        # name -> the policy that declared it first, so a refusal names the class
-        # that has to change rather than whichever wrapper is on the outside.
-        owner: dict[str, str] = {}
-        bodies: list[str] = []
-        for member in () if policy is None else iter_policy_tree(policy):
-            declared = getattr(member, "required_bodies", ()) or ()
-            if not declared:
-                continue
-            who = type(member).__name__
-            if isinstance(declared, str):
-                raise TypeError(
-                    f"{who}.required_bodies must be a sequence of body names, "
-                    f"not a bare str ({declared!r}) - a str iterates into one entry per character. "
-                    f"Use a tuple: ('{declared}',)."
-                )
-            for name in declared:
-                if not isinstance(name, str) or not name.strip():
-                    raise TypeError(f"{who}.required_bodies entries must be non-empty body-name strings, got {name!r}.")
-                if name not in owner:
-                    owner[name] = who
-                    bodies.append(name)
+        # The walk and its type refusals live in one place shared with the
+        # remote-inference handshake, so what a tree declares cannot depend on
+        # which surface asked. The mapping's value is the declaring class, so a
+        # refusal below names the class to fix rather than an outer wrapper.
+        owner = collect_required_bodies(policy)
+        bodies = list(owner)
         if not bodies:
             return ()
 
