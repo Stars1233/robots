@@ -5,7 +5,6 @@ state as structured RPCs and events via Device Connect's DeviceDriver interface.
 """
 
 import logging
-from collections.abc import Mapping
 from typing import Any
 
 from device_connect_edge.drivers import (
@@ -19,7 +18,7 @@ from device_connect_edge.drivers import (
 from device_connect_edge.types import DeviceIdentity, DeviceStatus
 
 from strands_robots.device_connect._authz import attached_runtime, authz_error, is_authorized_caller
-from strands_robots.mesh.core import _reports_failure_to_stop
+from strands_robots.mesh.core import _reported_a_rollout_in_flight, _reports_failure_to_stop
 from strands_robots.mesh.security import is_safe_policy_provider
 from strands_robots.teleop_mixin import _stop_reported_stopped
 
@@ -240,29 +239,32 @@ class SimulationDeviceDriver(DeviceDriver):
         only population would leave that rollout untouched. Which of these was
         actually in flight is the answer ``stop_policy`` gives, not a guess made
         here.
+
+        Read through the engine's own :meth:`~strands_robots.simulation.base.SimEngine.list_robots`
+        rather than off ``sim._world.robots``: that attribute is the MuJoCo and
+        Newton spelling of the registry, while the Isaac engine keeps its robots
+        in ``_robots`` and its ``_world`` is the Isaac ``World`` object, which
+        has no ``.robots`` at all. So the private read raised ``AttributeError``
+        on Isaac, and the recovery path below reported it as "the simulation
+        changed under the stop loop" - a race that had not happened - before any
+        robot was asked. ``list_robots`` is the ABC's own accessor and answers
+        ``[]`` on every backend when there is no world.
         """
-        world = getattr(self._sim, "_world", None)
-        if world is None:
-            return []
-        return list(world.robots)
+        return list(self._sim.list_robots())
 
     def _stop_one_rollout(self, robot_name: str) -> dict[str, Any]:
         """Stop one robot's rollout through the verb that owns the question.
 
-        Falls back to the durable flag write for a backend that exposes no
-        ``stop_policy``: :meth:`~strands_robots.simulation.base.SimEngine.start_policy`
-        is a synchronous passthrough there, so no worker outlives the call and
-        the flag is the whole answer. The fallback returns the same envelope
-        shape so the caller above grades one thing.
+        :meth:`~strands_robots.simulation.base.SimEngine.stop_policy` is that
+        verb on every backend, so this reads its answer instead of constructing
+        a second one. It used to fall back to writing the per-robot flag itself
+        whenever the attribute was missing - which was every backend but MuJoCo -
+        and that fallback both reached into ``sim._world.robots`` (absent on
+        Isaac) and re-derived the ``was_running`` verdict that
+        :meth:`~strands_robots.simulation.models.SimRobot.request_policy_stop`
+        exists to keep in one place.
         """
-        stop_policy = getattr(self._sim, "stop_policy", None)
-        if callable(stop_policy):
-            return dict(stop_policy(robot_name=robot_name))
-        robot = self._sim._world.robots[robot_name]
-        return {
-            "status": "success",
-            "content": [{"json": {"robot": robot_name, "was_running": bool(robot.request_policy_stop())}}],
-        }
+        return dict(self._sim.stop_policy(robot_name=robot_name))
 
     @rpc()
     async def getStatus(self) -> dict[str, Any]:
@@ -499,29 +501,3 @@ class SimulationDeviceDriver(DeviceDriver):
             joints: Dict of joint name -> position (radians)
         """
         pass
-
-
-def _reported_a_rollout_in_flight(answer: Mapping[str, Any]) -> bool | None:
-    """Whether a ``stop_policy`` answer says a rollout really was in flight.
-
-    Reads the ``was_running`` key
-    :meth:`~strands_robots.simulation.mujoco.simulation.MuJoCoSimEngine.stop_policy`
-    puts in its ``json`` block. Tri-state on purpose, in the same conservative
-    direction as :func:`~strands_robots.mesh.core._reports_failure_to_stop`: an
-    envelope that reports the fact neither way is not read as either one.
-    Counting silence as a halt names a robot the answer never mentioned;
-    counting it as idle lets the caller state "no rollout was in flight" on no
-    evidence. Both are the affirmative lie this verb exists to stop telling.
-
-    Args:
-        answer: One envelope returned by a stop verb.
-
-    Returns:
-        ``True`` or ``False`` as the answer reports it, or ``None`` when the
-        answer carries no verdict at all.
-    """
-    for block in answer.get("content", []):
-        payload = block.get("json")
-        if isinstance(payload, dict) and "was_running" in payload:
-            return bool(payload["was_running"])
-    return None
