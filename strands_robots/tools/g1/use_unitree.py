@@ -42,6 +42,21 @@ Safety rails:
       are flagged loudly in every response envelope - including the error
       envelope, where the flag is what says whether an unanswered command
       may still be executing.
+    * Private SDK names (``_Call``, ``_CallNoReply``, ...) are refused rather
+      than gated: they reach the same RPC as the typed methods without
+      naming what they command, so no operator could approve one knowingly.
+    * Every mutative or high-danger op stops for operator approval BEFORE
+      the SDK RPC is dispatched, through the same decision path the ROS
+      transports use (:func:`~strands_robots.tools._command_gate.gate_motion`):
+      ``STRANDS_UNITREE_COMMAND_ALLOW`` (comma-separated ``service.operation``
+      entries, or ``*``) pre-approves; ``BYPASS_TOOL_CONSENT=true`` lifts the
+      gate with a WARNING; otherwise the operator is prompted through the
+      tool context, and with no context reachable the call is refused and
+      nothing is sent. A log line is not an authorization control: before
+      this gate an agent steered by untrusted content could walk the robot
+      or drop its torque with only a warning in the log (F-001, CWE-862).
+      Meta and read-only ops are never gated, and neither is
+      ``loco.StopMove`` - stopping must never get harder.
     * Prefer the FSM-gated verbs (``g1_send_action``, ``g1_run_policy``,
       ``g1_set_stand_height``, ...) for routine motion - they route
       through :meth:`~strands_robots.drivers.g1.G1Driver._check_motion_gates`.
@@ -57,7 +72,9 @@ import threading
 from typing import Any
 
 from strands import tool
+from strands.types.tools import ToolContext
 
+from strands_robots.tools._command_gate import gate_motion
 from strands_robots.tools.g1._g1_common import _DDS_INIT_LOCK, ensure_dds
 
 logger = logging.getLogger(__name__)
@@ -133,6 +150,14 @@ HIGH_DANGER_OPS = {
     ("motion_switcher", "ReleaseMode"),  # robot uncontrolled
 }
 
+# Pre-approve ``service.operation`` pairs (comma-separated, ``*`` for all) for
+# headless runs. Read by the shared gate, which also honours BYPASS_TOOL_CONSENT.
+COMMAND_ALLOW_ENV = "STRANDS_UNITREE_COMMAND_ALLOW"
+
+# Mutative by prefix (``Stop``) but never gated: it is the tool's own emergency
+# stop, and an approval prompt in front of a halt makes the robot less safe.
+_UNGATED_STOP_OPS = frozenset({("loco", "StopMove")})
+
 
 def _is_readonly(operation_name: str) -> bool:
     if operation_name in READONLY_WHITELIST:
@@ -142,9 +167,34 @@ def _is_readonly(operation_name: str) -> bool:
     return operation_name.startswith("Get") or operation_name.startswith("Check")
 
 
+def _is_private(operation_name: str) -> bool:
+    """Whether *operation_name* is SDK plumbing rather than an operation of this tool.
+
+    ``unitree_sdk2py.rpc.client.Client`` - the base class of every client in
+    :data:`SERVICES` - carries the raw transport underneath the typed methods
+    (``_Call(apiId, parameter)``, ``_CallNoReply``, ``_CallBinary``), and each
+    typed method is a thin wrapper over it, so ``_Call(7105, ...)`` is the wire
+    form of ``LocoClient.SetVelocity`` and walks the robot exactly as far.
+
+    The one owner of that question, because three surfaces have to answer it the
+    same way: :func:`use_unitree` refuses such a name before dispatch,
+    :func:`describe_operation` declines to describe it, and :func:`_is_mutative`
+    fails closed on it.
+    """
+    return operation_name.startswith("_")
+
+
 def _is_mutative(operation_name: str) -> bool:
     if _is_readonly(operation_name):
         return False
+    if _is_private(operation_name):
+        # Nothing in a raw name says whether it writes - the command is in the
+        # opaque ``apiId``. :func:`_is_readonly` already declines to call such a
+        # name a read; this is the other half of that, so the classification
+        # fails closed. ``use_unitree`` refuses these before consulting it, and
+        # this is what the surface falls back to if that refusal is ever
+        # removed: gated, rather than dispatched with no prompt at all.
+        return True
     return any(operation_name.startswith(p) for p in MUTATIVE_PREFIXES)
 
 
@@ -306,6 +356,15 @@ def describe_operation(service_name: str, operation_name: str) -> dict[str, Any]
     """
     if service_name not in SERVICES:
         return {"error": f"unknown service: {service_name}"}
+    if _is_private(operation_name):
+        # The inspect reader resolves these on the base class and would answer
+        # ``is_mutative: False, high_danger: False`` for a raw RPC that can walk
+        # the robot - telling a caller the surface is harmless, moments before
+        # use_unitree refuses it. Decline, as list_operations already does.
+        return {
+            "error": f"unknown operation: {service_name}.{operation_name} (private SDK plumbing)",
+            "available": list_operations(service_name),
+        }
 
     qualname, _t = SERVICES[service_name]
 
@@ -425,13 +484,39 @@ def _execute(
     return {"ok": True, "result": _normalize_response(raw)}
 
 
-@tool
+def _gate(service_name: str, operation_name: str, high_danger: bool, tool_context: ToolContext | None) -> str | None:
+    """Operator approval for one mutative RPC, before it is dispatched.
+
+    Args:
+        service_name: A key of :data:`SERVICES`.
+        operation_name: The client method about to be called.
+        high_danger: Whether the pair is in :data:`HIGH_DANGER_OPS`; only
+            changes the wording the operator sees.
+        tool_context: The agent tool context supplying ``interrupt()``.
+
+    Returns:
+        A refusal message, or None to let the RPC proceed.
+    """
+    target = f"{service_name}.{operation_name}"
+    what = "can drop or walk the robot" if high_danger else "commands the robot"
+    return gate_motion(
+        "use_unitree",
+        operation_name,
+        target,
+        f"{target!r} {what}; it needs operator approval before it is sent.",
+        tool_context,
+        allow_env=COMMAND_ALLOW_ENV,
+    )
+
+
+@tool(context=True)
 def use_unitree(
     service_name: str,
     operation_name: str,
     parameters: dict[str, Any] | None = None,
     label: str = "",
     network_interface: str = "eth0",
+    tool_context: ToolContext | None = None,
 ) -> dict[str, Any]:
     """Universal interface to every Unitree SDK2 client method.
 
@@ -454,6 +539,16 @@ def use_unitree(
     Prefer the FSM-gated driver verbs (g1_send_action, g1_run_policy) for
     routine motion; use_unitree is the raw escape hatch.
 
+    OPERATOR APPROVAL: every mutative op (and every high-danger op) stops
+    for a human before the RPC is sent. Pre-approve with
+    STRANDS_UNITREE_COMMAND_ALLOW=loco.SetVelocity,audio.TtsMaker (or '*');
+    BYPASS_TOOL_CONSENT=true lifts the gate. Reads, meta ops and
+    loco.StopMove are never gated. The SDK's private plumbing (_Call,
+    _CallNoReply, ...) is refused outright rather than gated - it reaches
+    the same RPC as the typed methods without naming what it commands, so
+    neither an operator nor the danger table can judge it. Name the typed
+    operation instead.
+
     EXAMPLES:
       use_unitree('audio', 'TtsMaker', {'text': 'Hello', 'speaker_id': 0})
       use_unitree('audio', 'LedControl', {'R': 255, 'G': 0, 'B': 0})
@@ -471,6 +566,10 @@ def use_unitree(
             lookup target (e.g. {'service_name': 'loco'}).
         label: Optional human-readable description, echoed in the response.
         network_interface: DDS interface. Default 'eth0'.
+        tool_context: Supplied by the agent runtime; carries the operator
+            interrupt the mutative ops are approved through. Without it a
+            mutative op is refused unless pre-approved via
+            STRANDS_UNITREE_COMMAND_ALLOW or BYPASS_TOOL_CONSENT=true.
 
     Returns:
         Dict with status/message plus service, operation, label, result,
@@ -527,6 +626,31 @@ def use_unitree(
             "message": f"unknown service '{service_name}'. Valid: {sorted(SERVICES)} (or 'meta' for discovery)",
         }
 
+    # Private SDK plumbing (_Call, _CallNoReply, _CallBinary, ...) on the
+    # base rpc.client.Client bypasses the prefix-based classifier, so refuse
+    # it before the classifier runs.  list_operations already filters these
+    # names, so they are undiscoverable; this makes them undispatchable too.
+    if _is_private(operation_name):
+        return {
+            "status": "error",
+            "message": (
+                f"{service_name}.{operation_name} refused: private SDK methods "
+                f"(names starting with '_') are not dispatchable. "
+                f"Use list_operations to discover the public surface."
+            ),
+            "dispatched": False,
+            "service": service_name,
+            "operation": operation_name,
+            "label": label,
+            # Classified like every other envelope this tool returns - see the
+            # Returns section: an absent flag cannot be told apart from False,
+            # so dropping these would read a refused raw RPC exactly like a
+            # refused GetFsmId. The name cannot say what the call was, so the
+            # answer is the most dangerous thing it could be.
+            "mutative": True,
+            "high_danger": True,
+        }
+
     high_danger = (service_name, operation_name) in HIGH_DANGER_OPS
     mutative = _is_mutative(operation_name)
 
@@ -549,6 +673,18 @@ def use_unitree(
         "mutative": mutative,
         "high_danger": high_danger,
     }
+
+    if (high_danger or mutative) and (service_name, operation_name) not in _UNGATED_STOP_OPS:
+        refusal = _gate(service_name, operation_name, high_danger, tool_context)
+        if refusal is not None:
+            # Nothing was dispatched: the gate runs before ``_execute`` touches
+            # the bus, so a refused ZeroTorque is exactly as inert as a read.
+            return {
+                "status": "error",
+                "message": f"{service_name}.{operation_name} refused: {refusal}",
+                "dispatched": False,
+                **classification,
+            }
 
     res = _execute(service_name, operation_name, params, network_interface=network_interface)
 
