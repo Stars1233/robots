@@ -27,7 +27,10 @@ MOTION_ACTIONS: dict[str, frozenset[str]] = {
     # robot_mesh is deliberately ABSENT: it raises its own SDK-native interrupt
     # (tool_context.interrupt in strands_robots/tools/robot_mesh.py) on every
     # physical action, so listing it here would ask the operator twice for one
-    # command. This dict gates only the dashboard's bespoke tools.
+    # command. So is the Robot agent tool (strands_robots/hardware_robot.py):
+    # its real-mode execute/start run through the shared command gate and spend
+    # a grant this hook deposited (consume_grant) rather than asking again.
+    # This dict gates only the dashboard's bespoke tools.
     # The direct-serial tools live in strands_robots/tools/serial_tool.py and
     # strands_robots/tools/pose_tool.py. Both now gate their own write / motion
     # actions through the shared command gate (serial_tool's four writes, and
