@@ -1706,11 +1706,17 @@ class LerobotLocalPolicy(Policy):
         """Initialize RTC if the loaded policy supports it.
 
         RTC is supported by flow-matching policies that implement
-        ``predict_action_chunk(**kwargs)``. It requires the policy to have
-        an ``rtc_config`` on its config.
+        ``predict_action_chunk(**kwargs)`` and whose config class declares an
+        ``rtc_config`` field: SmolVLA, Pi0 and Pi0.5 do, ACT and Diffusion do
+        not. The field's VALUE is an inference-time choice rather than a
+        training artifact, so every public checkpoint ships it as ``None``.
 
-        Auto-detection: if ``rtc_enabled=None`` (default), RTC is enabled
-        when the model's config has ``rtc_config.enabled=True``.
+        ``rtc_enabled=None`` (the default) auto-detects and therefore enables
+        RTC only for a checkpoint saved with ``rtc_config.enabled=True``.
+        ``rtc_enabled=True`` constructs the config the caller asked for and
+        hands it to lerobot's ``init_rtc_processor()``; a policy whose config
+        declares no ``rtc_config`` field is warned about and falls back to
+        ``select_action()``.
         """
         if not self._loaded or self._policy is None:
             return
@@ -1740,6 +1746,31 @@ class LerobotLocalPolicy(Policy):
             # Auto-detect: use model's rtc_config.enabled
             self._rtc_enabled = rtc_config is not None and getattr(rtc_config, "enabled", False)
         elif self._rtc_requested is True:
+            if (
+                rtc_config is None
+                and config is not None
+                and hasattr(config, "rtc_config")
+                and hasattr(self._policy, "init_rtc_processor")
+            ):
+                # A flow-matching policy whose checkpoint ships ``rtc_config=None``
+                # - every public SmolVLA/Pi0 checkpoint does, RTC is an inference
+                # time choice - so construct the config the caller asked for and
+                # let lerobot build its processor from it (``init_rtc_processor``
+                # also pushes the processor into the already-built model).
+                from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+                overrides: dict[str, Any] = {"enabled": True}
+                if self._rtc_execution_horizon is not None:
+                    overrides["execution_horizon"] = self._rtc_execution_horizon
+                if self._rtc_max_guidance_weight is not None:
+                    overrides["max_guidance_weight"] = self._rtc_max_guidance_weight
+                rtc_config = RTCConfig(**overrides)
+                config.rtc_config = rtc_config
+                self._policy.init_rtc_processor()
+                logger.info(
+                    "RTC requested and policy '%s' shipped no rtc_config - constructed one.",
+                    type(self._policy).__name__,
+                )
             if rtc_config is None:
                 # User explicitly asked for RTC, but this policy has no rtc_config.
                 # This means it's not a flow-matching policy - warn and disable.
@@ -2310,7 +2341,13 @@ class LerobotLocalPolicy(Policy):
         else:
             batch = self._build_observation_batch(observation, instruction)
 
-        with torch.inference_mode():
+        # ``no_grad`` rather than ``inference_mode``: lerobot's RTC guidance
+        # (``RTCProcessor.denoise_step``) re-enables autograd inside the denoiser
+        # to take ``torch.autograd.grad`` against the prefix error, which an
+        # inference-mode tensor cannot do ("element 0 of tensors does not
+        # require grad"). The non-RTC paths are unaffected: ``predict_action_chunk``
+        # / ``select_action`` already run under lerobot's own ``@torch.no_grad``.
+        with torch.no_grad():
             assert self._policy is not None
             self._policy.eval()
             # RTC uses predict_action_chunk() directly with cross-chunk guidance;

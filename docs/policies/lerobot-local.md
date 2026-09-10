@@ -229,6 +229,15 @@ policy = create_policy("lerobot_local", pretrained_name_or_path="lerobot/smolvla
                         rtc_enabled=True, rtc_execution_horizon=16, rtc_max_guidance_weight=1.0)
 ```
 
+Every public flow-matching checkpoint ships `config.rtc_config = None` - RTC
+is an inference-time choice, not a training artifact - so `rtc_enabled=True`
+builds that config from your `rtc_execution_horizon` /
+`rtc_max_guidance_weight` (lerobot's defaults for the rest) and hands it to
+lerobot's `init_rtc_processor()`. Only the flow-matching config classes
+declare the field: ask ACT or Diffusion for RTC and the provider warns and
+runs `select_action()`. `rtc_enabled=None` (the default) follows whatever the
+checkpoint itself was saved with.
+
 The sim consumes `policy.execution_horizon` actions from each chunk before
 re-querying - `rtc_execution_horizon` (default 10) for an RTC policy, the full
 chunk otherwise. For relative-action checkpoints (pi0 / pi0.5 / pi0-FAST
