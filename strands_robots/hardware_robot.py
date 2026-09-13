@@ -825,6 +825,13 @@ class Robot(TeleopMixin, AgentTool):
         # hint that the operator who set ros2_bridge=True actually needs to see.
         # require_optional caches the
         # module, so the real bridge construction in _init_ros_bridge pays nothing.
+        # The two posture flags are graded first: ``"false"`` is truthy, so read
+        # here by truthiness it would run the rclpy probe and, on a box without a
+        # sourced distro, tell a caller who asked for no bridge to install ROS 2.
+        # _init_ros_bridge grades them again for callers that enter there.
+        for flag_name, flag_value in (("ros2_bridge", ros2_bridge), ("ros2_commands", ros2_commands)):
+            if error := boolean_flag_error(flag_value, flag_name, type(self).__name__):
+                raise ValueError(error)
         if ros2_bridge:
             self._check_ros2_bridge_deps(ros2_transport=ros2_transport)
 
