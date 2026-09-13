@@ -398,7 +398,9 @@ arm_ro = Robot("so101", mode="real", ros2_bridge=True, ros2_commands=False)
 
 # rclpy-free: run the SAME bridge over pure cyclonedds (no sourced ROS 2
 # distro). Byte-identical topics; type coverage bounded by the IDL bundle.
-arm_rtps = Robot("so101", mode="real", ros2_bridge=True, ros2_transport="rtps")
+# Telemetry-only: on this transport the inbound command surface refuses to
+# start without a dds_security_config or the explicit opt-out (see below).
+arm_rtps = Robot("so101", mode="real", ros2_bridge=True, ros2_transport="rtps", ros2_commands=False)
 ```
 
 External ROS 2 nodes - rviz, nav2, or the agent's own `use_ros` calls - then see

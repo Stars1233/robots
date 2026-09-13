@@ -160,9 +160,11 @@ a single pip wheel, no rclpy and no sourced distro:
 ```python
 from strands_robots import Robot
 
-# rclpy-free: publishes /so101/joint_states (+ camera image_raw) and subscribes
-# /so101/joint_command -> send_action, all over cyclonedds RTPS.
-arm = Robot("so101", mode="real", ros2_bridge=True, ros2_transport="rtps")
+# rclpy-free: publishes /so101/joint_states (+ camera image_raw) over cyclonedds
+# RTPS. Telemetry-only: the inbound /so101/joint_command -> send_action surface
+# (ros2_commands=True, the default) drives the arm, so on this transport it needs
+# the dds_security_config or explicit opt-out described below to start.
+arm = Robot("so101", mode="real", ros2_bridge=True, ros2_transport="rtps", ros2_commands=False)
 ```
 
 The two transports emit byte-identical topics, so a real ROS 2 node (or
@@ -171,7 +173,7 @@ The two transports emit byte-identical topics, so a real ROS 2 node (or
 ```bash
 ros2 topic echo /so101/joint_states     # decodes the cyclonedds-published JointState
 ros2 topic pub --once /so101/joint_command sensor_msgs/msg/JointState \
-  '{name: ["shoulder_pan.pos"], position: [0.1]}'   # drives the arm
+  '{name: ["shoulder_pan.pos"], position: [0.1]}'   # drives the arm once commands are on (below)
 ```
 
 The trade-off is the same as `use_rtps`: type coverage is bounded by the IDL
