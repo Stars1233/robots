@@ -43,7 +43,6 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
-import re
 import threading
 import time
 import typing
@@ -52,13 +51,11 @@ from typing import Any
 from strands import tool
 from strands.types.tools import ToolContext
 
-from strands_robots.rtps.mangling import ros_topic_error
+from strands_robots.rtps.mangling import dds_type_name, ros_topic_error
 from strands_robots.tools._command_gate import gate_command
 from strands_robots.tools._numeric_options import numeric_option_error
 
 logger = logging.getLogger(__name__)
-
-_TYPE_RE = re.compile(r"^[A-Za-z0-9_]+/(msg|srv|action)/[A-Za-z0-9_]+\Z")
 
 # Which numeric options each action actually consumes. ``status``, ``types``,
 # ``advertise`` and ``subscribe`` read none of them, so the guard below is driven
@@ -238,8 +235,11 @@ def use_rtps(
     # is by name.
     if topic is not None and (clause := ros_topic_error(topic)) is not None:
         return _err(f"invalid topic name: {topic!r} ({clause})")
-    if type is not None and not _TYPE_RE.match(type):
-        return _err(f"invalid interface type: {type!r} (expected pkg/msg/Name)")
+    if type is not None:
+        try:
+            dds_type_name(type)
+        except ValueError as exc:
+            return _err(f"invalid interface type: {exc}")
 
     # Numeric options are checked here, alongside the names and ahead of the
     # backend probe, so the same caller mistake is reported identically whether

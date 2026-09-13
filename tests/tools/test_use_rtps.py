@@ -85,6 +85,30 @@ def test_invalid_type_rejected() -> None:
     assert "invalid interface type" in _texts(result)
 
 
+@pytest.mark.parametrize(
+    ("kind_type", "generated"),
+    [
+        ("example_interfaces/srv/AddTwoInts", "example_interfaces::srv::dds_::AddTwoInts_Request_"),
+        ("nav2_msgs/action/NavigateToPose", "nav2_msgs::action::dds_::NavigateToPose_Goal_"),
+    ],
+)
+def test_service_and_action_types_are_refused_before_the_backend_probe(
+    kind_type: str, generated: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # docs/rtps-integration.md, Type coverage: a pkg/srv/Name or pkg/action/Name
+    # type is refused with the types ROS 2 does generate quoted. The refusal is
+    # the mangling's own (dds_type_name), so it reads the same with or without
+    # cyclonedds and never reaches the install hint or the IDL bundle lookup.
+    monkeypatch.setattr(rtps_mod._backend, "available", lambda: False)
+    result = use_rtps(action="advertise", topic="/x", type=kind_type)
+    assert result["status"] == "error"
+    text = _texts(result)
+    assert "invalid interface type" in text
+    assert generated in text
+    assert "cyclonedds is required" not in text
+    _ascii_only(result)
+
+
 # Status / no-backend -------------------------------------------------------
 
 
