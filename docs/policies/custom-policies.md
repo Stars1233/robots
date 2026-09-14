@@ -9,11 +9,14 @@ description: Implement the Policy ABC, register the provider, plug it into Robot
 from strands_robots.policies import Policy, register_policy
 
 class MyPolicy(Policy):
+    _keys: list[str] = []
+
     async def get_actions(self, observation_dict, instruction, **kwargs):
-        return [{"motor.0": 0.5, "motor.1": -0.2}]   # list of action dicts
+        # one dict per control tick, keyed by the robot's own joint/actuator names
+        return [{key: 0.0 for key in self._keys}]
 
     def set_robot_state_keys(self, keys: list[str]) -> None:
-        self._keys = keys
+        self._keys = keys   # the runtime calls this with the robot's keys before the rollout
 
     @property
     def provider_name(self) -> str:
