@@ -110,8 +110,15 @@ def _register_shipped_drivers() -> None:
             module = importlib.import_module(module_path)
             driver_cls = getattr(module, class_name)
             canonical_names = shipped_robot_names(module, robot_names)
-        except Exception:  # noqa: BLE001 - a broken driver must not break the seam
-            logger.debug("Shipped driver %s.%s did not import; skipping", module_path, class_name)
+        except Exception as exc:  # noqa: BLE001 - a broken driver must not break the seam
+            logger.warning(
+                "Shipped driver %s.%s did not import (%s: %s); its robots have no native driver until that is fixed",
+                module_path,
+                class_name,
+                type(exc).__name__,
+                exc,
+            )
+            logger.debug("Shipped driver %s import traceback", module_path, exc_info=exc)
             continue
         for canonical in canonical_names:
             try:
