@@ -3492,8 +3492,11 @@ class MuJoCoSimEngine(
             "# write qpos directly and run forward kinematics (teleport / set an "
             "initial pose, bypassing the actuators). dict is per-joint; list is "
             "ordered and must match one robot's joint count (see get_features). "
-            "The write is all-or-nothing: a dict key that is not a joint of the "
-            "model is an error, not a silent skip (see robot_joint_names). "
+            "The write is all-or-nothing: a dict key that names neither a joint "
+            "of the model (see robot_joint_names) nor, on a robot whose registry "
+            "entry carries joint_labels, one of those labels -- the SO arms "
+            "accept shoulder_pan..gripper for their servo ids, bare or "
+            "'<robot>/<label>' -- is an error, not a silent skip. "
             "Kinematic only: a joint held by a position servo is pulled back "
             "toward the servo's existing setpoint by the next step, and the "
             "success text names those joints; hold=True moves the matching "
@@ -3795,9 +3798,14 @@ class MuJoCoSimEngine(
                     "angular_velocity": [float(v) for v in data.qvel[vadr + 3 : vadr + 6]],
                 }
 
+            # A registry label beside a joint the asset names by servo id or CAD
+            # term (``1 (shoulder_pan)``), so the agent reading this can address
+            # the joint by what it does; ``set_joint_positions`` accepts the label.
+            labels = self._robot_joint_labels(robot)
             text = f"'{robot_name}' state (t={self._world.sim_time:.3f}s):\n"
             for jnt, vals in state.items():
-                text += f"{jnt}: pos={vals['position']:.4f}, vel={vals['velocity']:.4f}\n"
+                shown = f"{jnt} ({labels[jnt]})" if jnt in labels else jnt
+                text += f"{shown}: pos={vals['position']:.4f}, vel={vals['velocity']:.4f}\n"
             if base is not None:
                 p_, q_ = base["position"], base["quaternion"]
                 lv_, av_ = base["linear_velocity"], base["angular_velocity"]
@@ -3809,6 +3817,8 @@ class MuJoCoSimEngine(
                 )
 
             json_payload: dict[str, Any] = {"state": state}
+            if labels:
+                json_payload["joint_labels"] = {jnt: labels[jnt] for jnt in state if jnt in labels}
             if base is not None:
                 json_payload["base"] = base
 
