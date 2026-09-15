@@ -73,7 +73,7 @@ import weakref
 from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from strands.tools.tools import AgentTool
 from strands.types._events import ToolResultEvent
@@ -6851,6 +6851,40 @@ class MuJoCoSimEngine(
         if flat.get("path"):
             payload["video"] = flat
 
+    #: Parameters through which a method already spells "which camera".
+    #: A method that declares one of these names the camera there, so its
+    #: ``name`` is a different fact and ``camera_name`` must not be bound to
+    #: it: ``start_cameras_recording`` selects cameras through ``cameras``
+    #: and its ``name`` is the output filename tag.
+    _CAMERA_NAMING_PARAMS: ClassVar[frozenset[str]] = frozenset({"camera_name", "cameras"})
+
+    @staticmethod
+    def _camera_name_alias_target(action: str, method_param_names: set[str]) -> str | None:
+        """The parameter ``camera_name`` stands for on a camera action, or ``None``.
+
+        ``add_camera`` / ``remove_camera`` declare ``name``; ``render`` and its
+        siblings declare ``camera_name``. Both mean "which camera", so on those
+        two ``camera_name`` is accepted for ``name``.
+
+        The answer is ``None`` unless the action's name says ``camera`` AND
+        ``name`` is the camera on it - which requires that the method has no
+        other parameter naming one (:attr:`_CAMERA_NAMING_PARAMS`). ``render``
+        spells it ``camera_name``, so its own parameter is never rewritten;
+        ``start_cameras_recording`` spells it ``cameras``, so its ``name`` (the
+        output filename tag) is left alone - binding a camera into it recorded
+        every camera in the scene under that tag and reported success, where
+        the refusal it replaced names ``cameras`` in its ``Valid:`` list. On a
+        non-camera action such as ``add_object``, ``camera_name`` stays
+        unknown.
+        """
+        if (
+            "camera" not in action
+            or not method_param_names.isdisjoint(MuJoCoSimEngine._CAMERA_NAMING_PARAMS)
+            or "name" not in method_param_names
+        ):
+            return None
+        return "name"
+
     def _validate_and_build_kwargs(
         self,
         action: str,
@@ -6904,6 +6938,14 @@ class MuJoCoSimEngine(
             accepted_field_names.add("robot_name")
         if "robot_name" in method_param_names:
             accepted_field_names.add("name")
+        # The same courtesy for cameras: add_camera/remove_camera take ``name``
+        # while render/render_depth/get_camera_params take ``camera_name``, so
+        # an agent that just rendered from ``camera_name="wrist"`` and now
+        # removes it writes ``camera_name`` again. On a camera action whose
+        # method spells it ``name``, that is the same fact, not an unknown key.
+        camera_name_target = self._camera_name_alias_target(action, method_param_names)
+        if camera_name_target:
+            accepted_field_names.add("camera_name")
 
         # 1) Unknown kwargs (skipped for **kwargs methods which legitimately passthrough)
         unknown = [] if method_has_var_keyword else [k for k in remapped if k not in accepted_field_names]
@@ -6999,6 +7041,8 @@ class MuJoCoSimEngine(
         for param_name, param in named_params.items():
             if param_name == "name" and "name" not in remapped and "robot_name" in remapped:
                 kwargs["name"] = remapped["robot_name"]
+            elif param_name == camera_name_target and param_name not in remapped and "camera_name" in remapped:
+                kwargs[param_name] = remapped["camera_name"]
             elif param_name == "robot_name" and "robot_name" not in remapped and "name" in remapped:
                 kwargs["robot_name"] = remapped["name"]
             elif param_name in remapped:
