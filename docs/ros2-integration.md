@@ -14,7 +14,7 @@ calls.
 
 ```python
 from strands import Agent
-from strands_robots.tools import use_ros
+from strands_robots import use_ros
 
 agent = Agent(tools=[use_ros])
 agent("list the ROS 2 topics, then drive /turtle1 forward and confirm its pose changed")

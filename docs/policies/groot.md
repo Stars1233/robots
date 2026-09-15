@@ -157,7 +157,7 @@ registry `gripper` block instead of guessing the gripper heuristically.
 ## Container lifecycle
 
 ```python
-from strands_robots.tools import gr00t_inference
+from strands_robots import gr00t_inference
 
 # The image name is operator config, not an agent parameter: set
 # STRANDS_GR00T_IMAGE (default "gr00t:latest") and it must pass the

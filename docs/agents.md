@@ -24,7 +24,7 @@ uv pip install strands-agents "strands-robots[sim-mujoco]"
 ## Add more tools
 
 ```python
-from strands_robots.tools import gr00t_inference, pose_tool
+from strands_robots import gr00t_inference, pose_tool
 
 agent = Agent(tools=[robot, gr00t_inference, pose_tool])
 agent("Start a GR00T server on port 5555 with so100_dualcam, "

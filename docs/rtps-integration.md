@@ -102,7 +102,7 @@ and DDS reports a type mismatch as silence rather than as an error.
 ## Examples
 
 ```python
-from strands_robots.tools import use_rtps
+from strands_robots import use_rtps
 
 use_rtps(action="status")
 use_rtps(action="types")

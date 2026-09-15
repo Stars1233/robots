@@ -60,7 +60,7 @@ ros2 launch rosbridge_server rosbridge_websocket_launch.xml
 ## Examples
 
 ```python
-from strands_robots.tools import use_rosbridge
+from strands_robots import use_rosbridge
 
 # Check connectivity
 use_rosbridge(action="status", host="192.168.1.20")

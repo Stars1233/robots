@@ -362,7 +362,7 @@ if name is None:
 
 ```python
 from strands import Agent
-from strands_robots.tools import robot_mesh
+from strands_robots import robot_mesh
 
 agent = Agent(tools=[sim_a, robot_mesh])
 agent("Find every robot on the mesh and ask each one to report its status")

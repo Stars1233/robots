@@ -113,7 +113,7 @@ launching.
 ```python
 from strands import Agent
 from strands_robots import Robot
-from strands_robots.tools import train_policy
+from strands_robots import train_policy
 
 agent = Agent(tools=[Robot("so100", mesh=False), train_policy])
 agent("Record 50 cube-pick episodes, then post-tune lerobot ACT on the dataset "

@@ -5,7 +5,7 @@ description: Strands @tool helpers for hardware bring-up - calibrate, camera, te
 # Hardware tools
 
 ```python
-from strands_robots.tools import (
+from strands_robots import (
     lerobot_camera, lerobot_teleoperate, lerobot_train,
     pose_tool, serial_tool, download_assets,
     gr00t_inference,   # see GR00T page
@@ -342,7 +342,7 @@ result = lerobot_teleoperate(
 ```python
 from strands import Agent
 from strands_robots import Robot
-from strands_robots.tools import lerobot_camera, pose_tool, serial_tool
+from strands_robots import lerobot_camera, pose_tool, serial_tool
 
 agent = Agent(tools=[
     Robot("so100"),

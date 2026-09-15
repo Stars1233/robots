@@ -35,6 +35,15 @@ when the tool is wanted. This guard bans the ambiguous read instead of grading
 what each site does with the result, because the read is ambiguous whatever the
 site intends.
 
+The docs are held to the same rule, because a reader runs a fence in whatever
+process they already have: ``from strands_robots import Robot`` - the first line
+of nearly every page - imports ``strands_robots.mesh``, which imports the
+``use_ros`` / ``use_rosbridge`` / ``use_rtps`` submodules, so the page's own
+``from strands_robots.tools import use_ros`` then binds the module and
+``use_ros(action=...)`` raises ``TypeError: 'module' object is not callable``.
+A fence reads a tool off the package root (``from strands_robots import
+use_ros``), whose lazy export has no same-named submodule to shadow it.
+
 The complementary spelling - a plain ``tools.X`` attribute read - is graded,
 within its own module, by
 ``tests/tools/test_tool_actions_block_names_the_dispatched_vocabulary.py``.
@@ -44,6 +53,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -64,6 +74,12 @@ _PACKAGE_MODULE = "strands_robots.tools"
 #: cannot report a clean tree. ``examples`` is among them because an example is
 #: run by a reader, and both example sites read the ambiguous spelling.
 _REQUIRED_AREAS = frozenset({"strands_robots", "tests", "tests_integ", "scripts", "examples"})
+
+#: A ``python`` code fence in a Markdown page, with its body captured.
+_PYTHON_FENCE = re.compile(r"^```python[^\n]*\n(.*?)^```", re.DOTALL | re.MULTILINE)
+
+#: The banned spelling as text, for a fence ``ast`` cannot parse (a prose placeholder).
+_TEXT_READ = re.compile(r"^from strands_robots\.tools import\s*(\([^)]*\)|[^\n]*)", re.MULTILINE)
 
 
 def _shadowable_names() -> frozenset[str]:
@@ -94,6 +110,32 @@ def _ambiguous_reads(tree: ast.AST, shadowable: frozenset[str]) -> list[tuple[in
         for alias in node.names
         if alias.name in shadowable
     )
+
+
+def _ambiguous_reads_in_fence(body: str, shadowable: frozenset[str]) -> list[tuple[int, str]]:
+    """Every banned read in one docs fence, by ``ast`` or, failing that, by text.
+
+    Args:
+        body: The fence body.
+        shadowable: Names for which the package attribute has two values.
+
+    Returns:
+        ``(line within the fence, name)`` for each shadowable name read off the package.
+    """
+    try:
+        return _ambiguous_reads(ast.parse(body), shadowable)
+    except SyntaxError:
+        return sorted(
+            (body[: match.start()].count("\n") + 1, name)
+            for match in _TEXT_READ.finditer(body)
+            for name in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", re.sub(r"#[^\n]*", "", match.group(1)))
+            if name in shadowable
+        )
+
+
+def _docs_pages() -> list[Path]:
+    """Every Markdown page a reader is told to run fences from."""
+    return [_REPO_ROOT / "README.md", *sorted((_REPO_ROOT / "docs").rglob("*.md"))]
 
 
 def _scanned_areas() -> tuple[str, ...]:
@@ -214,6 +256,40 @@ class TestNoAmbiguousReadShipsInTheTree:
             "the tool, which turns the module-alias form used elsewhere into a read of the tool: "
             f"{offenders}"
         )
+
+
+class TestNoAmbiguousReadShipsInTheDocs:
+    """The same ban over every ``python`` fence a docs page tells a reader to run."""
+
+    def test_no_docs_fence_reads_a_shadowable_tool_name_off_the_package(self) -> None:
+        """A fence reads a tool off the package root, never off ``strands_robots.tools``."""
+        shadowable = _shadowable_names()
+        offenders = []
+        for page in _docs_pages():
+            text = page.read_text(encoding="utf-8")
+            for match in _PYTHON_FENCE.finditer(text):
+                fence_line = text[: match.start()].count("\n") + 2
+                for line, name in _ambiguous_reads_in_fence(match.group(1), shadowable):
+                    offenders.append(f"{page.relative_to(_REPO_ROOT)}:{fence_line + line - 1} imports {name!r}")
+
+        assert not offenders, (
+            "a docs fence reads a tool name off strands_robots.tools; after `from strands_robots import "
+            "Robot` that name is the submodule and calling it raises TypeError - spell it "
+            f"`from strands_robots import <tool>`: {sorted(offenders)}"
+        )
+
+    def test_the_docs_scan_reaches_the_tools_page(self) -> None:
+        """A fence that constructs a tool and calls it is parsed, not skipped."""
+        page = _REPO_ROOT / "docs" / "hardware" / "tools.md"
+        bodies = [match.group(1) for match in _PYTHON_FENCE.finditer(page.read_text(encoding="utf-8"))]
+
+        assert any("serial_tool(action=" in body for body in bodies), "premise: tools.md calls a tool in a fence"
+
+    def test_the_text_fallback_reads_a_parenthesised_import(self) -> None:
+        """An unparsable fence still yields its banned read, comments and aliases aside."""
+        body = "x = (\nfrom strands_robots.tools import (\n    use_ros,  # see page\n    pose_tool as p,\n)\n"
+
+        assert _ambiguous_reads_in_fence(body, _shadowable_names()) == [(2, "pose_tool"), (2, "use_ros")]
 
 
 class TestTheScanIsNonVacuous:

@@ -57,7 +57,7 @@ library. Each step is a distinct capability; the pages linked cover the details.
 ```python
 from strands import Agent
 from strands_robots import Robot
-from strands_robots.tools import train_policy
+from strands_robots import train_policy
 
 # 1. TELEOPERATE a real SO-101 with its leader arm and RECORD demos.
 follower = Robot("so101", mode="real", port="/dev/ttyACM0",
