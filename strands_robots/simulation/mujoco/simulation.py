@@ -6113,7 +6113,7 @@ class MuJoCoSimEngine(
                         {
                             "text": (
                                 f"Cannot '{action_name}' on '{robot_name}' while its policy is running. "
-                                f"Stop it first: action='stop_policy', name='{robot_name}'."
+                                f"Stop it first: action='stop_policy', robot_name='{robot_name}'."
                             )
                         }
                     ],
@@ -6127,10 +6127,7 @@ class MuJoCoSimEngine(
                 "status": "error",
                 "content": [
                     {
-                        "text": (
-                            f"Cannot '{action_name}' while a policy is running on {names}. "
-                            "Stop it first: action='stop_policy'."
-                        )
+                        "text": f"Cannot '{action_name}' while a policy is running on {names}. {self._stop_policy_remedy(active)}"
                     }
                 ],
             }
@@ -7614,8 +7611,9 @@ class MuJoCoSimEngine(
         stop_policy unconditionally. The only error case is an unknown
         robot_name.
 
-        empty robot_name returns a clear error instead of a silent
-        match against the first robot.
+        An empty robot_name means the only rollout in flight when there is
+        exactly one, and is otherwise refused naming what is running - never
+        a silent match against the first robot (:meth:`_stop_policy_target`).
 
         Returns:
             The agent-tool envelope. On success its ``json`` block reports
@@ -7623,11 +7621,15 @@ class MuJoCoSimEngine(
             stop arrived - so a caller aggregating several of these answers
             reads the verdict rather than matching on the sentence.
         """
-        if not robot_name:
-            return {
-                "status": "error",
-                "content": [{"text": "stop_policy requires 'robot_name'."}],
-            }
+        # An empty name means "the only rollout in flight" when there is exactly
+        # one - the case every "Stop it first: action='stop_policy'" remedy was
+        # written for - and is refused, naming what IS running, otherwise. See
+        # :meth:`SimEngine._stop_policy_target`.
+        target, refusal = self._stop_policy_target(robot_name)
+        if target is None:
+            assert refusal is not None
+            return refusal
+        robot_name = target
         if self._world is None or not registered(self._world.robots, robot_name):
             return {"status": "error", "content": [{"text": self._unknown_robot_msg(robot_name)}]}
         robot = self._world.robots[robot_name]
