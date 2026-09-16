@@ -8124,6 +8124,9 @@ class MuJoCoSimEngine(
             if exited:
                 self._prune_done_futures()
         if not was_running:
+            # The verdict is right and the silence was not: a rollout that died
+            # on its first inference reads exactly like one that completed. The
+            # shared renderer carries that reason and the in-flight population.
             msg = self._was_not_running_msg(robot_name)
         elif exited is False:
             msg = (
