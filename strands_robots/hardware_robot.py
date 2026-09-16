@@ -1767,13 +1767,60 @@ class Robot(TeleopMixin, AgentTool):
             return True, ""
 
         except Exception as e:
-            error_msg = f"Robot connection failed: {e}. Ensure robot is calibrated and accessible on the specified port"
+            error_msg = self._connect_failure_message(e)
             logger.error(f"{error_msg}")
             # Same rollback as the lazy teleop connect: without it a half-open
             # port makes the NEXT _connect_robot short-circuit on
             # "already connected" and report success against a dead bus.
             self._close_open_devices()
             return False, error_msg
+
+    def _connect_failure_message(self, exc: BaseException) -> str:
+        """Name the device that failed to open and the remedy for that device.
+
+        lerobot's ``connect()`` opens the motors bus, then each camera; either
+        raises its own message. The wrapper used to append one fixed remedy -
+        "Ensure robot is calibrated and accessible on the specified port" - to
+        whichever came up, so a camera that did not exist was answered with a
+        calibration hint (and an agent relayed "recalibrate if needed" for an
+        unplugged arm). A camera message names lerobot's object,
+        ``OpenCVCamera(99)``, not the key the operator wrote in ``cameras=``;
+        that key is looked up here so the reply says which camera.
+
+        The lookup matches the camera *objects* lerobot built, the way
+        :meth:`_close_open_devices` reads them, because every backend writes
+        every one of its messages with ``f"{self}"`` -- the object's ``str`` is
+        the one identity the text is sure to carry, whatever the backend and
+        whatever failed (opening, warmup, a read). No config field can serve as
+        that identity: only ``OpenCVCameraConfig`` declares ``index_or_path``,
+        so matching a config named a webcam and left every other registered
+        backend -- RealSense (``serial_number``), ZMQ
+        (``camera_name@address:port``), Reachy 2 (``name, image_type``) -- with
+        the general remedy, which is the calibration hint for a camera fault
+        this method exists to remove.
+
+        Args:
+            exc: What ``connect()`` raised.
+
+        Returns:
+            One message naming the device and the remedy for that device.
+        """
+        text = " ".join(str(exc).split()).rstrip(".")
+        cameras = getattr(self.robot, "cameras", None)
+        for key, camera in cameras.items() if isinstance(cameras, Mapping) else ():
+            if str(camera) in text:
+                return (
+                    f"Robot connection failed: camera {key!r} did not open - {text}. "
+                    "Fix or remove that entry in cameras=; the motors bus is closed again."
+                )
+        port = getattr(getattr(self.robot, "config", None), "port", None)
+        if "port" in text.lower():
+            where = f" on port {port!r}" if port else ""
+            return (
+                f"Robot connection failed: {text}. The motors bus did not open{where}: check the USB "
+                "cable and power, then find the port (lerobot-find-port or scan_serial_devices)."
+            )
+        return f"Robot connection failed: {text}. Ensure the robot is powered, on the right port and calibrated."
 
     async def _initialize_policy(self, policy: Policy) -> bool:
         """Initialize policy with robot state keys."""
