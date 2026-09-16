@@ -56,8 +56,9 @@ from strands.tools.tools import AgentTool
 from strands.types._events import ToolInterruptEvent, ToolResultEvent
 from strands.types.tools import ToolContext, ToolResult, ToolSpec, ToolUse
 
+from strands_robots import hardware_observe
 from strands_robots._serial_discovery import describe_serial_candidates, scan_serial_devices
-from strands_robots.bus_access import read_observation, write_action
+from strands_robots.bus_access import bus_lock, read_observation, write_action
 from strands_robots.policies.base import instruction_not_read_notice, provider_policy_class
 from strands_robots.registry.policies import policy_requires_error
 from strands_robots.ros_telemetry import ROS2_SYSTEM_INSTALL_HINT
@@ -87,6 +88,24 @@ logger = logging.getLogger(__name__)
 # The agent-tool actions that dispatch a rollout to real actuators. ``status``
 # and ``stop`` only read or halt, so they are never gated.
 MOTION_ACTIONS = frozenset({"execute", "start"})
+
+# Every action the tool publishes, in the order the schema lists them. The
+# ``action`` enum and the unknown-action refusal are two readings of one
+# vocabulary, and they were kept as two literals: the observe verbs were added
+# to the enum while the refusal went on naming only the four motion ones, so an
+# agent that misspelled ``get_state`` was told the valid actions were "execute,
+# start, status, stop" and could conclude that reading the arm was not offered.
+# Both now read this, so a verb cannot be published without being named.
+_PUBLISHED_ACTIONS = (
+    "get_state",
+    "get_robot_state",
+    "list_cameras",
+    "render",
+    "execute",
+    "start",
+    "status",
+    "stop",
+)
 
 # Pre-approve motion actions by name (comma-separated, ``*`` for all) for
 # headless runs. Read by the shared gate, which also honours BYPASS_TOOL_CONSENT.
@@ -1733,6 +1752,156 @@ class Robot(TeleopMixin, AgentTool):
         # port and the surviving cameras shut.
         self._close_open_devices()
 
+    def _observe_ledger(self) -> set[str]:
+        """The devices an observe action opened that no connect has yet been handed.
+
+        Entries are ``"bus"`` and ``"camera:<name>"``. Created by the first
+        observe action rather than in ``__init__``: a tool that never observed
+        has no ledger and nothing to hand back, and that is the same answer.
+
+        Created under the device lock, double-checked. Two first-ever observers
+        - an agent's ``get_state`` on a ``to_thread`` worker and the teleop
+        loop's lazy connect - would otherwise each build a set and the second
+        assignment clobber the first's recorded open, leaving that device
+        permanently outside the hand-back. ``bus_access.bus_lock`` guards its
+        own creation the same way, for the same reason.
+        """
+        ledger: set[str] | None = getattr(self, "_observe_opened", None)
+        if ledger is not None:
+            return ledger
+        with bus_lock(self.robot):
+            ledger = getattr(self, "_observe_opened", None)
+            if ledger is None:
+                ledger = set()
+                self._observe_opened = ledger
+            return ledger
+
+    def _hand_back_observe_devices(self) -> None:
+        """Close every device an observe action left open, so ``connect()`` starts from nothing.
+
+        ``get_state`` opens the motor bus alone and ``render`` opens one
+        camera, and each leaves its device open so the next read is cheap.
+        lerobot's ``Robot.connect()`` cannot start from either: every device's
+        own ``connect()`` is ``@check_if_already_connected``, so an open bus is
+        refused before any camera opens, and an open camera is refused in the
+        camera loop - *before* ``configure()``, which is where the operating
+        mode, the PID gains and the gripper's current and torque limits are
+        written. The two failures are not alike. The bus one is a refused
+        connect. The camera one is a connect that reports success: with one
+        camera, ``is_connected`` (``bus and all(cameras)``) reads True once the
+        bus is up, so the rollout drives servos the driver never configured.
+
+        The trigger is the ledger, not ``is_connected``, because on an arm with
+        **no** cameras an open bus *is* ``is_connected`` - so a gate keyed on
+        that field skips ``connect()`` altogether, and ``get_state`` followed by
+        a rollout drives an arm whose ``configure()`` never ran. Measured on the
+        fake: ``(True, "")`` with ``configure_calls == 0``. What the ledger
+        records is what this tool borrowed; a robot the caller connected
+        themselves is not in it and is left as they left it.
+
+        A close that fails raises: the caller refuses and rolls back, instead of
+        letting the driver's ``DeviceAlreadyConnectedError`` pass for a robot
+        that was already up. That is the one way this differs from
+        ``_close_open_devices``, which is best-effort because it runs where
+        there is nothing left to refuse.
+
+        Synchronous, and called only from :meth:`_bring_up_robot`, which holds
+        ``bus_lock(self.robot)`` from before this hand-back until ``connect()``
+        has returned. The lock is re-entered here around the bus close so the
+        contract is stated where the close is; it is the lock ``get_state``,
+        ``render`` and the mesh probes open and read under, so a read in flight
+        finishes before the port goes, and no observe action can open a device
+        between this hand-back and the connect that follows it.
+
+        Raises:
+            Exception: Whatever the device's own ``disconnect()`` raised,
+                unchanged - the ledger keeps the entry, so the next connect
+                tries again.
+        """
+        ledger = self._observe_ledger()
+        if not ledger:
+            return
+        robot = self.robot
+        if "bus" in ledger:
+            bus = getattr(robot, "bus", None)
+            if bus is not None and getattr(bus, "is_connected", False):
+                logger.info("closing the bus an observe action opened so %s can connect fully", robot)
+                with bus_lock(robot):
+                    # disable_torque=False: nothing was energised, and a torque
+                    # write to a bus that was only ever read is the register
+                    # write the observe actions promise not to make.
+                    bus.disconnect(disable_torque=False)
+            ledger.discard("bus")
+        cameras = getattr(robot, "cameras", None)
+        for entry in sorted(e for e in ledger if e.startswith("camera:")):
+            name = entry.removeprefix("camera:")
+            camera = cameras.get(name) if isinstance(cameras, Mapping) else None
+            if camera is not None and getattr(camera, "is_connected", False):
+                logger.info("closing camera %s an observe action opened so %s can connect fully", name, robot)
+                camera.disconnect()
+            ledger.discard(entry)
+
+    def _bring_up_robot(self) -> None:
+        """Hand back what an observe action borrowed, then connect - one unit under the device lock.
+
+        An observe action leaves its device open: ``get_state`` the motor bus,
+        ``render`` one camera. lerobot's ``connect()`` cannot start from either,
+        and the two fail differently - an open bus refuses the connect, an open
+        camera lets it *succeed* with ``configure()`` skipped. So every borrowed
+        device goes back BEFORE ``is_connected`` is read: on a camera-less arm
+        the open bus alone reads as connected.
+
+        The three steps are one critical section under ``bus_lock(self.robot)``
+        because the observe actions are ungated by design, so an agent or a
+        monitor calls them freely beside a bring-up. Serialising each device
+        operation was not enough: between a hand-back that had closed the bus
+        and the ``is_connected`` read that followed it there was a thread hop,
+        and a ``get_state`` landing in that hop reopened the bus - so the read
+        answered True, ``connect()`` was skipped, and the rollout drove servos
+        whose operating mode, gains and torque limits ``configure()`` never
+        wrote. The observe actions take the same lock around their own
+        check-and-open, so one that loses the race waits for the connect to
+        finish and then finds a robot already up.
+
+        Synchronous, so the lock is released by the thread that took it: the
+        teleop loop calls it directly and :meth:`_connect_robot` runs it in one
+        ``to_thread`` call. ``RLock``, so the nested acquisitions inside the
+        hand-back and the driver are fine.
+
+        Raises:
+            Exception: A hand-back that failed, unchanged - the caller refuses
+                and rolls back rather than letting the driver's
+                ``DeviceAlreadyConnectedError`` pass for a robot that was
+                already up. Or whatever ``connect()`` raised, except the
+                already-connected refusal, which is reachable here only for a
+                device the caller opened themselves and is what the ledger
+                deliberately leaves alone.
+        """
+        from lerobot.utils.errors import DeviceAlreadyConnectedError
+
+        with bus_lock(self.robot):
+            self._hand_back_observe_devices()
+            # Not a return: the calibration check in ``_connect_robot`` runs on
+            # this path too. It used to be skipped for a connected robot, so a
+            # refused first call (bus left open) made the second call report
+            # success for an arm the gate had refused.
+            if self.robot.is_connected:
+                logger.info(f"{self.robot} already connected")
+                return
+            logger.info(f"Connecting to {self.robot}...")
+            try:
+                self.robot.connect(False)  # calibrate=False
+            except DeviceAlreadyConnectedError:
+                # Expected and fine - a device the caller connected themselves
+                logger.info(f"{self.robot} was already connected")
+            except Exception as e:
+                # The string version of the same refusal
+                error_str = str(e).lower()
+                if "already connected" in error_str or "is already connected" in error_str:
+                    logger.info(f"{self.robot} connection already established")
+                else:
+                    raise
+
     async def _connect_robot(self) -> tuple[bool, str]:
         """Connect to robot hardware with proper error handling.
 
@@ -1740,33 +1909,10 @@ class Robot(TeleopMixin, AgentTool):
             tuple[bool, str]: (success, error_message) - error_message is empty on success
         """
         try:
-            # Import lerobot exceptions
-            from lerobot.utils.errors import DeviceAlreadyConnectedError
-
-            # Check if already connected
-            if self.robot.is_connected:
-                logger.info(f"{self.robot} already connected")
-                return True, ""
-
-            logger.info(f"Connecting to {self.robot}...")
-
-            # Handle robot connection using lerobot's error handling patterns
-            try:
-                if not self.robot.is_connected:
-                    await asyncio.to_thread(self.robot.connect, False)  # calibrate=False
-
-            except DeviceAlreadyConnectedError:
-                # This is expected and fine - robot is already connected
-                logger.info(f"{self.robot} was already connected")
-
-            except Exception as e:
-                # Check if it's the string version of "already connected" error
-                error_str = str(e).lower()
-                if "already connected" in error_str or "is already connected" in error_str:
-                    logger.info(f"{self.robot} connection already established")
-                else:
-                    # Re-raise if it's a different error
-                    raise e
+            # Hand-back, ``is_connected`` and ``connect()`` as one locked unit,
+            # in one thread: ``_bring_up_robot`` says why the three cannot be
+            # separated by an ``await``.
+            await asyncio.to_thread(self._bring_up_robot)
 
             # Final connection check
             if not self.robot.is_connected:
@@ -1774,13 +1920,47 @@ class Robot(TeleopMixin, AgentTool):
                 logger.error(f"{error_msg}")
                 return False, error_msg
 
-            # Check robot calibration
-            if hasattr(self.robot, "is_calibrated") and not self.robot.is_calibrated:
+            # Check robot calibration, reading the flag exactly once. On a
+            # lerobot arm ``is_calibrated`` is ``read_calibration()`` - a
+            # homing-offset and range sweep of every servo - and the guard used
+            # to be ``hasattr(self.robot, "is_calibrated") and not
+            # self.robot.is_calibrated``, which evaluated it twice. ``hasattr``
+            # also swallows an ``AttributeError`` raised *inside* that read,
+            # which is indistinguishable from "this driver has no such
+            # property": a driver whose ``is_calibrated`` is
+            # ``self.bus.is_calibrated`` over a bus built lazily raises exactly
+            # that, and the gate was then skipped altogether - measured
+            # ``(True, "")``, cameras open and ``configure()`` already run, for
+            # an arm whose calibration was never checked. Absent is not the same
+            # as unreadable: a driver that declares the attribute at all (on the
+            # class as a property, or on the instance as a plain flag) must
+            # answer, and a read that raises falls to the handler below, which
+            # refuses and closes the port. A driver with no notion of
+            # calibration is calibrated by lerobot's own contract for the
+            # property: "should be always True if not applicable".
+            try:
+                is_calibrated = self.robot.is_calibrated
+            except AttributeError:
+                if hasattr(type(self.robot), "is_calibrated"):
+                    raise  # the property exists; its own read failed
+                is_calibrated = True
+            if not is_calibrated:
                 error_msg = (
                     f"Robot {self.robot} is not calibrated. Please calibrate the robot manually"
                     " first using LeRobot's calibration process (lerobot-calibrate)"
                 )
                 logger.error(f"{error_msg}")
+                # Refused, so close what this attempt opened. ``connect()``
+                # above succeeded - bus open, cameras open, ``configure()``
+                # run - and this check is the first to say no. Left open, the
+                # NEXT attempt short-circuits on ``is_connected`` at the top
+                # of this method and returns success for an arm this branch
+                # just refused: the calibration gate would hold for exactly
+                # one call. It also held the serial port for the life of the
+                # process, so `lerobot-calibrate` - the remedy this message
+                # names - could not open it. Measured on an uncalibrated
+                # SO-101: first call refused, second call ``(True, "")``.
+                self._close_open_devices()
                 return False, error_msg
 
             logger.info(f"{self.robot} connected and ready")
@@ -3188,7 +3368,9 @@ class Robot(TeleopMixin, AgentTool):
     def _unknown_action_text(self, action: Any) -> str:
         """The refusal for an action this tool does not have.
 
-        Names the four verbs the real robot tool does have, and for the
+        Names every verb the real robot tool does have - the observe ones as
+        well as the motion ones, read from the same tuple the ``action`` enum
+        is built from - and for the
         spellings an agent is known to reach for it also names where that verb
         lives: the ``lerobot_teleoperate`` tool for teleoperation, the
         simulation tool for dataset recording, and this tool's own
@@ -3210,7 +3392,7 @@ class Robot(TeleopMixin, AgentTool):
             the verb is a known one that lives elsewhere - or here under
             another name.
         """
-        text = f"Unknown action: {refusal_str(action)}. Valid actions: execute, start, status, stop"
+        text = f"Unknown action: {refusal_str(action)}. Valid actions: {', '.join(_PUBLISHED_ACTIONS)}"
         kind = self._ELSEWHERE_ACTIONS.get(action) if isinstance(action, str) else None
         if kind == "teleoperation":
             text += (
@@ -3525,27 +3707,50 @@ class Robot(TeleopMixin, AgentTool):
     @property
     def tool_spec(self) -> ToolSpec:
         """Get tool specification with async actions."""
+        # The first sentence is the first thing an agent does with the tool, so
+        # it leads with what can be learned for free. Before the observe actions
+        # existed the only verbs were the motion ones, and an agent asked to
+        # "read the joint positions, do not move" requested a ten-second mock
+        # policy rollout on the real arm to do the reading.
+        port = getattr(getattr(self.robot, "bus", None), "port", None)
+        where = f" on {port}" if port else ""
         return {
             "name": self.tool_name_str,
-            "description": f"Drive the real robot {self.robot} with a policy. "
-            f"Actions: execute (blocking), start (async), status, stop. "
-            f"execute/start pause for operator approval before the arm moves - the call returns only "
-            f"after the operator answers (a headless script pre-approves with "
-            f"{COMMAND_ALLOW_ENV}=execute,start) - and run for at most duration seconds (default 30). "
-            f"They need instruction; the default provider groot also needs policy_port (the server it "
-            f"dials), while mock and lerobot_local build in process with no server - mock ignores the "
-            f"instruction and drives a test motion on every joint, and lerobot_local needs "
-            f"pretrained_name_or_path (the checkpoint it loads). "
-            f"status/stop take no other parameters.",
+            "description": (
+                f"Drive the real robot {self.robot}{where} with a policy, or read it for free. "
+                "Observe (no approval, writes nothing): get_state (alias get_robot_state) = joint "
+                "degrees, ticks, torque, voltage; list_cameras; render = a camera frame. "
+                "Motion: execute (blocking), start (async), status, stop. execute/start pause for "
+                "operator approval before the arm moves (a headless script pre-approves with "
+                f"{COMMAND_ALLOW_ENV}=execute,start) and run for at most duration seconds (default 30). "
+                "They need instruction; the default provider groot also needs policy_port, while "
+                "mock and lerobot_local build in process with no server - mock ignores the instruction, "
+                "and lerobot_local needs pretrained_name_or_path. No set_joint_positions/move_to "
+                "here: to read the arm call get_state, never execute."
+            ),
             "inputSchema": {
                 "json": {
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
-                            "description": "Action to perform: execute (blocking), start (async), status, stop",
-                            "enum": ["execute", "start", "status", "stop"],
-                            "default": "execute",
+                            "description": (
+                                "get_state | get_robot_state | list_cameras | render (observe, ungated); "
+                                "execute | start (motion, operator approval); status | stop"
+                            ),
+                            "enum": list(_PUBLISHED_ACTIONS),
+                            "default": "get_state",
+                        },
+                        "camera_name": {
+                            "type": "string",
+                            "description": "render: which configured camera (see list_cameras). Optional when there is exactly one.",
+                        },
+                        "output_path": {
+                            "type": "string",
+                            "description": (
+                                "render: PNG destination inside the render sandbox (~/.strands_robots/renders or "
+                                "STRANDS_ROBOTS_RENDER_ROOT); default <robot>-<camera>-<ms>.png."
+                            ),
                         },
                         "instruction": {
                             "type": "string",
@@ -3703,6 +3908,92 @@ class Robot(TeleopMixin, AgentTool):
             allow_match=lambda allowed: "*" in allowed or action in allowed,
         )
 
+    def _observe(self, action: str, tool_input: Mapping[str, Any]) -> dict[str, Any]:
+        """Answer one observe action: a read of the arm, never a write to it.
+
+        ``get_state``/``get_robot_state`` open the motor bus if it is closed
+        (the bus only - not the robot's ``connect()``, whose ``configure()``
+        writes servo registers) and read positions, torque and voltage; on an
+        arm with no calibration the degrees are the encoder estimate and the
+        text says so. ``list_cameras`` opens nothing. ``render`` opens the
+        named camera on first use, saves one PNG in the render sandbox and returns
+        the frame as an ``image`` block so the model sees it, as the simulation's
+        ``render`` does.
+
+        A failure names the port and the remedy rather than the SDK's
+        traceback: a read that cannot open the port is the one message a
+        developer reads first on a new machine.
+        """
+        try:
+            if action in ("get_state", "get_robot_state"):
+                # The ledger is written by the open itself, not by this success
+                # path: a read that opens the bus and then raises must still
+                # leave "bus" on record, or no connect will hand it back.
+                state = hardware_observe.read_joint_state(self.robot, on_open=self._observe_ledger().add)
+                state["robot"] = self.tool_name_str
+                state["task_status"] = self._task_state.status.value
+                return {
+                    "status": "success",
+                    "content": [
+                        {"text": hardware_observe.format_joint_state(self.tool_name_str, state)},
+                        {"json": state},
+                    ],
+                }
+            if action == "list_cameras":
+                cams = hardware_observe.list_cameras(self.robot)
+                return {
+                    "status": "success",
+                    "content": [
+                        {"text": hardware_observe.format_cameras(self.tool_name_str, cams)},
+                        {"json": {"robot": self.tool_name_str, "cameras": cams}},
+                    ],
+                }
+            # render
+            camera_name = tool_input.get("camera_name")
+            output_path = tool_input.get("output_path")
+            frame = hardware_observe.capture_frame(
+                self.robot,
+                None if camera_name is None else str(camera_name),
+                None if output_path is None else str(output_path),
+                tool_name=self.tool_name_str,
+                on_open=self._observe_ledger().add,
+            )
+            png = frame.pop("png")
+            text = (
+                f"Saved one frame from camera {frame['camera']!r} to {frame['path']} "
+                f"({frame['width']}x{frame['height']}, {frame['channels']} channels, read {frame['read_ms']} ms)."
+            )
+            # The image block is what lets the model SEE the frame, as the simulation's
+            # ``render`` does; raw bytes, not base64 (Bedrock encodes on the wire).
+            return {
+                "status": "success",
+                "content": [
+                    {"text": text},
+                    {"image": {"format": "png", "source": {"bytes": png}}},
+                    {"json": frame},
+                ],
+            }
+        except ValueError as exc:
+            # A refusal this module composed: unknown camera, unsafe path, no cameras.
+            return {"status": "error", "content": [{"text": f"{self.tool_name_str}: {exc}"}]}
+        except Exception as exc:  # noqa: BLE001 - every hardware failure becomes a tool error that names the port
+            port = getattr(getattr(self.robot, "bus", None), "port", None)
+            lines = str(exc).strip().splitlines()
+            reason = lines[-1] if lines else type(exc).__name__
+            return {
+                "status": "error",
+                "content": [
+                    {
+                        "text": (
+                            f"{self.tool_name_str}: {action} could not read the arm on {port!r}: {reason} "
+                            "Check the arm is powered and the port is right (`lerobot-find-port`, or "
+                            "strands_robots._serial_discovery.scan_serial_devices()), and that no other "
+                            "process holds the port (`lsof <port>`)."
+                        )
+                    }
+                ],
+            }
+
     async def stream(
         self, tool_use: ToolUse, invocation_state: dict[str, Any], **kwargs: Any
     ) -> AsyncGenerator[ToolResultEvent | ToolInterruptEvent, None]:
@@ -3711,10 +4002,16 @@ class Robot(TeleopMixin, AgentTool):
             tool_use_id = tool_use.get("toolUseId", "")
             input_data = tool_use.get("input", {})
 
-            action = input_data.get("action", "execute")
+            action = input_data.get("action", "get_state")
 
             # Handle different actions
-            if action == "execute":
+            if action in hardware_observe.OBSERVE_ACTIONS:
+                # Reads. Serial I/O blocks, so each runs off the event loop;
+                # none of them writes a servo register, so none is gated.
+                result = await asyncio.to_thread(self._observe, action, input_data)
+                yield ToolResultEvent(self._make_tool_result(tool_use_id, result))
+
+            elif action == "execute":
                 # Blocking execution (legacy behavior)
                 instruction = input_data.get("instruction", "")
                 policy_port = input_data.get("policy_port")
@@ -4057,15 +4354,18 @@ class Robot(TeleopMixin, AgentTool):
             errors without exceptions tearing down the hot loop.
         """
         try:
-            if not getattr(self.robot, "is_connected", False):
-                # Lazy connect on first action. calibrate=False: a teleop
-                # session assumes the follower is already calibrated (same
-                # contract as the policy-run path).
-                try:
-                    self.robot.connect(False)
-                except Exception:
-                    self._close_open_devices()
-                    raise
+            # Lazy connect on first action, through the same locked unit as the
+            # policy-run path: a device an observe action opened goes back
+            # first - on a camera-less arm the open bus reads as connected, and
+            # a write would then reach servos the driver's ``configure()`` never
+            # set up - and no observe action can reopen it before the connect.
+            # calibrate=False: a teleop session assumes the follower is already
+            # calibrated (same contract as the policy-run path).
+            try:
+                self._bring_up_robot()
+            except Exception:
+                self._close_open_devices()
+                raise
             write_action(self.robot, action)
             return {"status": "success", "content": [{"text": "ok"}]}
         except Exception as e:  # noqa: BLE001 - surface as status, never kill the loop
