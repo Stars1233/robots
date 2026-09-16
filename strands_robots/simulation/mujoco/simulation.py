@@ -68,6 +68,7 @@ import logging
 import math
 import numbers
 import os
+import re
 import threading
 import time
 import weakref
@@ -566,6 +567,73 @@ def _published_string_params(field_aliases: dict[str, str]) -> frozenset[str]:
 # reason ``_PUBLISHED_ACTIONS`` is, and used to decide which spelling a refusal
 # may name: a model constrained to this schema can emit no other.
 _PUBLISHED_PARAMS: frozenset[str] = frozenset(_TOOL_SPEC_SCHEMA["properties"]) - {"action"}
+
+
+# An annotation JSON cannot construct: a callable, or an already-built Policy.
+# Applied to one union member at a time, never to the whole annotation - see
+# :func:`_tool_call_can_carry`.
+_UNCARRIABLE_ANNOTATION = re.compile(r"Callable|\bPolicy\b")
+
+
+def _union_members(text: str) -> list[str]:
+    """The top-level ``|`` members of an annotation's text.
+
+    Splitting only at bracket depth zero keeps a union that appears *inside* a
+    subscript out of the result: the members of
+    ``Callable[[Started | Step | Ended], None] | None`` are the callable and
+    ``None``, not the three event types.
+
+    Args:
+        text: The annotation rendered as text.
+
+    Returns:
+        The stripped top-level members, in source order.
+    """
+    members: list[str] = []
+    depth = start = 0
+    for index, char in enumerate(text):
+        if char in "[(":
+            depth += 1
+        elif char in "])":
+            depth -= 1
+        elif char == "|" and depth == 0:
+            members.append(text[start:index])
+            start = index + 1
+    members.append(text[start:])
+    return [member.strip() for member in members if member.strip()]
+
+
+def _tool_call_can_carry(param: inspect.Parameter) -> bool:
+    """Whether a JSON tool call can supply *param* at all.
+
+    A parameter that only ever holds a callback (``observer``, ``on_frame``) or
+    a live :class:`Policy` instance (``policy_object``) exists for the Python
+    caller; no JSON value satisfies it, so a refusal's "Valid:" list leaves it
+    out. Everything else is kept, an unannotated parameter included: the list
+    must never hide a key the caller could have used.
+
+    A union is judged member by member, because one alternative being
+    unreachable does not make the parameter unreachable. ``stop_when`` is
+    ``dict[str, Any] | Callable[[SimEngine], bool] | None`` - the schema
+    publishes it and documents the dict predicate DSL, and a tool call carries
+    that dict, so the callable alternative must not hide it. ``None`` alone is
+    not a value a caller passes to fill a parameter, so it never keeps one.
+
+    Args:
+        param: The method parameter as :func:`inspect.signature` reports it.
+
+    Returns:
+        ``False`` only when every alternative is a callable or a ``Policy``,
+        ``True`` otherwise.
+    """
+    annotation = param.annotation
+    if annotation is inspect.Parameter.empty:
+        return True
+    text = annotation if isinstance(annotation, str) else getattr(annotation, "__name__", None) or repr(annotation)
+    fillable = [member for member in _union_members(text) if member not in ("None", "NoneType")]
+    if not fillable:
+        return True
+    return any(_UNCARRIABLE_ANNOTATION.search(member) is None for member in fillable)
 
 
 def _reported_param_name(param: str, field_aliases: Mapping[str, str], received: Mapping[str, Any]) -> str:
@@ -7726,13 +7794,28 @@ class MuJoCoSimEngine(
             # exists to prevent, surviving in the one branch that read the loop
             # variable directly.
             reported_unknown = _reported_param_name(unknown[0], self._FIELD_ALIASES, received)
-            valid_sorted = sorted(
-                _reported_param_name(param, self._FIELD_ALIASES, received) for param in method_param_names - {"action"}
-            )
+            # The "Valid:" list is what the caller will pick from next, so it
+            # names only parameters a tool call can carry. A method may also
+            # take a callback or a live object (``observer``, ``stop_when``,
+            # ``on_frame``, ``success_fn``, ``policy_object``) for the Python
+            # caller; listing those to a model that just sent ``policy=`` sends
+            # it to keys it cannot fill, and the one it needs
+            # (``policy_provider`` / ``policy_config``) is buried between them.
+            reachable = {name for name in method_param_names - {"action"} if _tool_call_can_carry(named_params[name])}
+            valid_sorted = sorted(_reported_param_name(param, self._FIELD_ALIASES, received) for param in reachable)
+            # ...and the nearest of them is named, the way an unknown action or
+            # an unknown robot already is: ``policy`` is answered with
+            # ``policy_provider, policy_config`` instead of a 20-name list to
+            # scan.
+            hint = close_match_hint(reported_unknown, valid_sorted)
             return None, {
                 "status": "error",
                 "content": [
-                    {"text": (f"Unknown parameter '{reported_unknown}' for action '{action}'. Valid: {valid_sorted}")}
+                    {
+                        "text": (
+                            f"Unknown parameter '{reported_unknown}' for action '{action}'.{hint} Valid: {valid_sorted}"
+                        )
+                    }
                 ],
             }
 

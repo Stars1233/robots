@@ -3768,11 +3768,14 @@ class Robot(TeleopMixin, AgentTool):
                         "policy_provider": {
                             "type": "string",
                             "description": (
-                                "Policy provider name (e.g. groot, moveit2, lerobot_local, mock). "
+                                "Which policy backend runs: one of cosmos3, curobo, groot, kimodo, "
+                                "lerobot_async, lerobot_local, microduck, mock, moveit2, protomotions, "
+                                "remote, rl, wbc, wbc_gait. "
                                 "groot (default, needs policy_port) and moveit2 dial a server; "
                                 "lerobot_local runs a local checkpoint in process and needs "
                                 "pretrained_name_or_path; mock is a test motion on every joint that "
-                                "ignores the instruction. See list_providers()."
+                                "ignores the instruction. The model itself is named in policy_config. "
+                                "Not an action - an unknown name is refused listing the current registry."
                             ),
                             "default": "groot",
                         },
