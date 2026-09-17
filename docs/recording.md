@@ -1076,16 +1076,26 @@ So every flush refuses rather than continues. `save_episode()` and
 loop on the facade's behalf and reports the reason as `recording_save_error`
 beside its parquet-truth counts - `reset()` surfaces the
 failure instead of resetting into an undefined state, and a recorded
-`eval_policy` / `evaluate_benchmark` - one driven with an `on_frame` hook that
-calls `add_frame`, which is the only way those two feed a recorder - stops at the
-episode whose flush failed and reports the reason:
+`eval_policy` / `evaluate_benchmark` - run under an open recording they feed it
+themselves, one dataset episode per evaluation episode, and their answer names
+what was recorded (`Recorded 20 episode(s), N frames to <repo_id>`); a caller's
+own `on_frame` replaces that hook and then records only if it calls `add_frame`
+- stops at the episode whose flush failed and reports the reason:
 
 ```python
-result = sim.eval_policy(robot_name="so100", n_episodes=20, on_frame=hook)
+result = sim.eval_policy(robot_name="so100", n_episodes=20)
 payload = next(b["json"] for b in result["content"] if "json" in b)
 if payload["recording_save_error"]:      # None on every healthy evaluation
     ...   # status is "error"; episodes_completed is the episode it stopped at
 ```
+
+Those frames are labelled with the instruction the *policy* was given: the
+caller's `instruction=`, else - on the `evaluate_benchmark` route - the
+benchmark's own `spec.instruction`, which is the language a LIBERO/Meta-World
+spec ships with the task and what the eval loop conditions the policy on (#187).
+That is the precedence `run_policy(instruction=...)` already has over the
+session's `start_recording(task=...)`, so a recorded evaluation's `task` column
+names the task the rollout was actually driven with rather than `"untitled"`.
 
 `episodes_completed` and `success_rate` then cover only the episodes that ran, so
 an aggregate is never reported over episodes whose frames reached no dataset. The
