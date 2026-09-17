@@ -155,8 +155,9 @@ checkpoint_dir=...)` loads it and presents the trained actor as an ordinary
 ```python
 result = create_trainer("ppo").train(spec)
 
+sim = sr.Robot("so100", mode="sim")     # the robot make_env trained on
 sim.run_policy(
-    robot_name="so101",
+    robot_name="so100",
     policy_provider="rl",
     policy_config={"checkpoint_dir": result.checkpoint_dir},
     duration=10.0,
