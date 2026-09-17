@@ -26,6 +26,7 @@ import logging
 import math
 import numbers
 import os
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, SupportsFloat, cast
@@ -1153,6 +1154,72 @@ class SimEngine(ABC):
         has the same width as :meth:`robot_joint_names`.
         """
         return self.robot_joint_names(robot_name)
+
+    # Guards the one-time creation of an engine's per-thread binding slot.
+    # Two rollouts starting on two threads must not each create a slot and
+    # have one of them lost; after creation the slot itself is thread-local.
+    _PREDICATE_BINDING_INIT = threading.Lock()
+
+    def _predicate_binding(self) -> threading.local:
+        """This engine's per-thread ``predicate_robot`` slot, created on first use.
+
+        :class:`SimEngine` has no ``__init__`` of its own, so the slot is made
+        lazily rather than in a constructor every backend would have to call.
+        """
+        slot = self.__dict__.get("_predicate_binding_slot")
+        if slot is None:
+            with SimEngine._PREDICATE_BINDING_INIT:
+                slot = self.__dict__.get("_predicate_binding_slot")
+                if slot is None:
+                    slot = threading.local()
+                    self.__dict__["_predicate_binding_slot"] = slot
+        return slot
+
+    @property
+    def predicate_robot(self) -> str | None:
+        """The robot an unnamed ``base_*`` clause reads ON THIS THREAD, or ``None``.
+
+        Read-only; set through :meth:`bind_predicate_robot`. The binding is
+        thread-scoped, not scene-scoped: a rollout binds on the thread that
+        drives it and every per-step read of the binding happens on that same
+        thread, so two rollouts on two robots each read their own robot. See
+        :meth:`bind_predicate_robot` for why a scene-wide attribute could not
+        carry this.
+        """
+        return getattr(self._predicate_binding(), "robot", None)
+
+    def bind_predicate_robot(self, robot_name: str | None) -> None:
+        """Bind the robot an unnamed ``base_*`` clause reads, for the calling thread.
+
+        Benchmark and ``stop_when`` clauses default ``robot`` to "the sole
+        robot". In a multi-robot scene that used to resolve to the FIRST
+        registered robot, so ``evaluate_benchmark(benchmark_name='go2_walk_forward',
+        robot_name='go2')`` with an arm registered first probed the arm ("has no
+        floating base") and, with two floating-base robots, would have scored the
+        wrong one silently. ``run_policy`` / ``eval_policy`` / ``evaluate_benchmark``
+        call this with the robot they resolved; the predicate readers consult it
+        through :func:`~strands_robots.simulation.predicates._bound_robot`.
+
+        Concurrency contract: the binding is **per thread**. Rollouts are
+        per-robot and explicitly concurrent - ``start_policy`` submits each to
+        the engine's executor, and "policies on different robots can execute
+        concurrently" is a documented surface - so one scene-wide attribute
+        would make the last bind win: from that instant the OTHER rollout's
+        unnamed clauses (evaluated every step) would read the wrong robot,
+        silently, under ``status=success``. All three surfaces bind on the
+        thread that then drives the rollout, and every reader of the binding
+        (the ``base_*`` predicates, a benchmark's ``on_episode_start``
+        compatibility check) runs on that same thread, so a thread-local slot
+        is exactly the scope the binding needs. A refused or concurrent call
+        therefore cannot disturb a rollout in flight on another thread. The
+        binding stays until the same thread rebinds; a stale one (its robot
+        since removed) is dropped by the reader.
+
+        Args:
+            robot_name: The robot to bind, or ``None`` to restore the
+                sole-robot default on this thread.
+        """
+        self._predicate_binding().robot = robot_name
 
     def bind_policy_sim_context(self, policy: Any, robot_name: str) -> None:
         """Give a policy the backend sim context it needs to close the loop.
@@ -3262,6 +3329,7 @@ class SimEngine(ABC):
         # only - a programmatic callable is opaque) turns that silent
         # never-fires into an up-front structured error, including on
         # backends whose predicates cannot resolve bodies at all.
+        self.bind_predicate_robot(robot_name)
         if stop_when_fn is not None and isinstance(stop_when, dict):
             probe_err = self._stop_when_unresolved_error(stop_when)
             if probe_err is not None:
@@ -4843,6 +4911,7 @@ class SimEngine(ABC):
         n_episodes: int = 1,
         max_steps: int = 300,
         success_fn: str | None = None,
+        success_when: dict[str, Any] | None = None,
         policy_object: Policy | None = None,
         control_frequency: float | None = None,
         control_substeps: int | None = None,
@@ -4950,6 +5019,18 @@ class SimEngine(ABC):
         genuinely failed every episode. This case logs a warning and sets
         ``success_measured=false`` in the returned json; pass
         ``success_fn="contact"`` (or a callable) to measure real task success.
+
+        ``success_when`` is the other way to say what success IS: the same
+        predicate DSL as :meth:`run_policy`'s ``stop_when`` and a benchmark
+        spec's ``success`` clause - ``{'predicate': 'body_above_z', 'body':
+        'cube', 'z': 0.2}`` or an ``all`` / ``any`` group - compiled through the
+        closed predicate registry and probed against the live scene before the
+        first episode, so a body the scene does not have is refused up front
+        instead of scoring every episode a miss. ``success_fn`` (the named
+        ``'contact'`` criterion) and ``success_when`` are alternatives; passing
+        both is refused. Before this the only criterion an agent-tool call could
+        express was ``'contact'``, and a predicate spelled as a string
+        (``'base_beyond_x:0.5'``) was refused without saying what IS accepted.
 
         ``video`` optionally records one rollout MP4 PER EPISODE so an eval can
         be watched to see WHY episodes fail, not just read as an aggregate
@@ -5088,7 +5169,63 @@ class SimEngine(ABC):
         # per-robot claim answer ``None`` from the default seam and are unchanged.
         if err := self._require_no_running_policy("eval_policy", robot_name=resolved_robot):
             return err
+        # The binding is per thread (see bind_predicate_robot): what is bound
+        # here is read only by THIS thread's probe and episodes, so neither a
+        # call refused below nor an evaluation of another robot can retarget
+        # the unnamed clauses of a rollout in flight on another thread.
+        self.bind_predicate_robot(resolved_robot)
 
+        # ``success_when``: the stop_when DSL as a success criterion. Compiled
+        # and probed here, before any policy is built, for the same reason
+        # run_policy probes stop_when - a clause naming a body the scene does
+        # not have compiles clean and degrades to a constant False, and this
+        # surface's whole output is the success rate that constant would fake.
+        success_check: Callable[[dict[str, Any]], bool] | str | None = success_fn
+        if success_when is not None:
+            if success_fn is not None:
+                return {
+                    "status": "error",
+                    "content": [
+                        {
+                            "text": (
+                                "eval_policy: pass either success_fn (the named 'contact' criterion) or "
+                                "success_when (a predicate clause), not both - they are two spellings of "
+                                "the one success criterion an episode is scored by."
+                            )
+                        }
+                    ],
+                }
+            from strands_robots.simulation.benchmark_spec import (
+                compile_stop_when,
+                stop_when_referenced_entities,
+            )
+
+            try:
+                success_when_fn = compile_stop_when(success_when, context="success_when")
+            except ValueError as e:
+                return {"status": "error", "content": [{"text": f"eval_policy: {e}"}]}
+
+            def _success_when_err(text: str) -> dict[str, Any]:
+                return {"status": "error", "content": [{"text": f"eval_policy: {text}"}]}
+
+            probe_error = self._unresolvable_entity_error(
+                stop_when_referenced_entities(success_when),
+                subject="success_when",
+                consequence=(
+                    "The clause would never hold, so every episode would score a miss and the eval "
+                    "would report a 0% success rate that reads as an honest policy failure."
+                ),
+                err=_success_when_err,
+            )
+            if probe_error is not None:
+                return probe_error
+
+            engine = self
+
+            def _success_when_check(_obs: dict[str, Any]) -> bool:
+                return bool(success_when_fn(engine))
+
+            success_check = _success_when_check
         if err := self._validate_video_config(video, "eval_policy"):
             return err
         if err := self._validate_policy_object(policy_object, "eval_policy"):
@@ -5146,7 +5283,7 @@ class SimEngine(ABC):
             instruction=instruction,
             n_episodes=n_episodes,
             max_steps=max_steps,
-            success_fn=success_fn,
+            success_fn=success_check,
             control_frequency=control_frequency,
             control_substeps=control_substeps,
             action_horizon=action_horizon,
@@ -5471,6 +5608,10 @@ class SimEngine(ABC):
                 "status": "error",
                 "content": [{"text": self._unknown_robot_msg(resolved_robot)}],
             }
+        # Unnamed base_* clauses in the spec read the robot under evaluation,
+        # not the first registered one - bound before the probe below so the
+        # probe and the rollout agree.
+        self.bind_predicate_robot(resolved_robot)
 
         # The benchmark's own robot list, checked BEFORE the clause probe below.
         # The runner enforces it too (BenchmarkCompatibilityError before episode
