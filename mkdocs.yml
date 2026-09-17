@@ -75,6 +75,7 @@ nav:
   - Overview: examples/overview.md
 - Architecture: architecture.md
 - API Reference: api-reference.md
+- Tool Reference: reference/tools.md
 - Configuration: reference/configuration.md
 - Security: security.md
 - Tool Result Contract: contracts.md
@@ -83,6 +84,7 @@ nav:
 hooks:
   - docs/hooks/numbers.py
   - docs/hooks/robot_cards.py
+  - docs/hooks/tool_reference.py
 validation:
   links:
     anchors: warn
