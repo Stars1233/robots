@@ -9,11 +9,14 @@ Two-arm robots - Aloha, bimanual SO-ARM, Trossen WX-AI, OpenArm bimanual.
 ```python
 from strands_robots import Robot
 sim = Robot("aloha")            # Trossen Aloha bimanual - sim only, lerobot ships no ALOHA robot
-sim = Robot("bi_openarm")       # OpenArm bimanual
-sim = Robot("trossen_wxai")     # Trossen WX-AI
+# Trossen WX-AI - its asset is never auto-downloaded: place
+# trossen_wxai/trossen_ai_bimanual.xml under STRANDS_ASSETS_DIR first.
+sim = Robot("trossen_wxai")
 
-# Two SO-101 followers on one Feetech bus - hardware only, no sim twin.
-arms = Robot("bi_so_follower", mode="real",
+# Hardware only, no sim twin - one lerobot follower config per arm.
+arms = Robot("bi_so_follower", mode="real",      # two SO-101 followers on one Feetech bus
+             left_arm_config=..., right_arm_config=...)
+arms = Robot("bi_openarm", mode="real",          # two OpenArm followers on CAN
              left_arm_config=..., right_arm_config=...)
 ```
 
