@@ -88,8 +88,14 @@ def _auto_detect_mode(canonical: str) -> str:
 
     Priority:
         1. ``STRANDS_ROBOT_MODE`` env var (explicit override)
-        2. Robot-specific USB detection (Feetech/Dynamixel servo controllers)
-        3. Default to sim (safest - never accidentally send commands to hardware)
+        2. For a robot that declares hardware, its native driver's own
+           ``probe_hardware()`` - a robot reached over the network rather than a
+           serial bus answers for itself (a Reachy Mini's daemon answers ``GET
+           /api/daemon/status``; no USB scan can see it). Opt-in per driver: a
+           class that declares no such classmethod is not asked, and the probe
+           is asked once.
+        3. Robot-specific USB detection (Feetech/Dynamixel servo controllers)
+        4. Default to sim (safest - never accidentally send commands to hardware)
     """
     env_mode = os.getenv("STRANDS_ROBOT_MODE", "").lower().strip()
     if env_mode in ("sim", "real"):

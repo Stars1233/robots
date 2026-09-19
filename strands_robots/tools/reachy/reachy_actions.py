@@ -15,11 +15,11 @@ per verb from the ``_ACTIONS`` table. The ``driver`` parameter is typed
 :class:`~typing.Any` so no live-object type leaks into the generated tool
 schema.
 
-Four verbs (``reachy_play_sound``, ``reachy_volume``, ``reachy_camera``,
-``reachy_look_at``) name driver accessors that do not exist yet - the Mini's
-media rail is SDK-client-side and has no daemon REST path in this repository -
-so today they refuse by naming the accessor to plumb, exactly as
-``g1_move_velocity`` did before ``G1Driver.move_velocity`` landed.
+Twelve verbs, unchanged in number: the newer vocabulary (``say``,
+``track_face``, ``turn_to_sound``, ``look_at`` with motion, plain-word
+``express``) lives on the driver's own JSON tool spec - the surface an agent
+normally reaches, ``Agent(tools=[Robot("reachy_mini", mode="real")])`` - and
+not behind a handle no model can send.
 """
 
 from __future__ import annotations
@@ -105,34 +105,29 @@ _ACTIONS: dict[str, tuple[str, str, str]] = {
     ),
     "reachy_play_sound": (
         "play_sound",
-        "the verb plays one sound file through the driver's media path and reads back the envelope the driver produced",
-        "a callable ``play_sound(sound_file)`` returning the driver's "
-        "envelope - the Mini's media rail is not plumbed into ReachyDriver "
-        "yet, so this names the accessor to add",
+        "the verb asks the daemon to play a file on the robot's speaker and reads back the envelope the driver produced",
+        "a callable ``play_sound(sound_file, wobble=...)`` returning the driver's "
+        "envelope - pass the live ReachyDriver handle the orchestrator constructed",
     ),
     "reachy_volume": (
         "set_volume",
-        "the verb sets the speaker volume through the driver's media path "
-        "and reads back the envelope the driver produced",
-        "a callable ``set_volume(level)`` returning the driver's envelope - "
-        "the Mini's media rail is not plumbed into ReachyDriver yet, so this "
-        "names the accessor to add",
+        "the verb sets the speaker level through the daemon, whose setter also plays a short test sound",
+        "a callable ``set_volume(level, allow_test_sound=...)`` returning the driver's envelope - "
+        "pass the live ReachyDriver handle the orchestrator constructed",
     ),
     "reachy_camera": (
         "capture_frame",
         "the verb captures one frame from the head camera through the "
         "driver's media path and reads back the envelope the driver produced",
         "a callable ``capture_frame(save_path)`` returning the driver's "
-        "envelope - the Mini's media rail is not plumbed into ReachyDriver "
-        "yet, so this names the accessor to add",
+        "envelope - the driver owns native capture, validation and session cleanup",
     ),
     "reachy_look_at": (
-        "look_at_image",
-        "the verb servos the head toward a camera pixel through the driver's "
-        "media path and reads back the envelope the driver produced",
-        "a callable ``look_at_image(u, v)`` returning the driver's envelope - "
-        "the Mini's media rail is not plumbed into ReachyDriver yet, so this "
-        "names the accessor to add",
+        "look_at",
+        "the verb plans the pixel's head pose from the daemon's calibration and asks for one smooth move to it, "
+        "reading back the envelope the driver produced",
+        "a callable ``look_at(u, v, frame_width, frame_height, duration=...)`` returning the driver's envelope - "
+        "pass the live ReachyDriver handle the orchestrator constructed",
     ),
 }
 
@@ -402,17 +397,20 @@ def reachy_motors(driver: Any, mode: str = "") -> dict[str, Any]:
 
 
 @tool
-def reachy_play_sound(driver: Any, sound_file: str = "") -> dict[str, Any]:
+def reachy_play_sound(driver: Any, sound_file: str = "", wobble: bool = False) -> dict[str, Any]:
     """Play a sound file through the Mini's speaker.
 
-    Calls ``ReachyDriver.play_sound(sound_file)`` once. The media rail is not
-    plumbed into the driver yet, so today this refuses by naming the accessor
-    to add - the same shape ``g1_move_velocity`` had before its driver method
-    landed.
+    Calls ``ReachyDriver.play_sound(sound_file, wobble=wobble)`` once. The
+    file is resolved on the ROBOT: an absolute path there, a built-in asset
+    name (``wake_up.wav``) or a name uploaded to the daemon. The daemon
+    answers ``ok`` as soon as it accepted the file - even with no media
+    server, where playback is a no-op - so success is not proof of sound.
 
     Args:
         driver: The live ReachyDriver handle the orchestrator constructed.
-        sound_file: Path or builtin name of the audio file the daemon can read.
+        sound_file: Daemon-side path or asset name of the audio file.
+        wobble: Bob the head in sync with the audio. This moves the head and
+            stays on until ``driver.set_wobbling(False)``; off by default.
 
     Returns:
         The driver's envelope, success or refusal, unreshaped.
@@ -422,43 +420,56 @@ def reachy_play_sound(driver: Any, sound_file: str = "") -> dict[str, Any]:
         return refusal
     if not sound_file:
         return _refusal("reachy_play_sound: `sound_file` is required. Pass a path or builtin name like 'wake_up.wav'.")
-    return driver.play_sound(sound_file)
+    if (reason := boolean_flag_error(wobble, "wobble", "reachy_play_sound")) is not None:
+        return _refusal(reason)
+    return driver.play_sound(sound_file, wobble=wobble)
 
 
 @tool
-def reachy_volume(driver: Any, level: int | None = None) -> dict[str, Any]:
-    """Set the Mini's speaker volume, 0-100.
+def reachy_volume(driver: Any, level: int | str | None = None, allow_test_sound: bool = False) -> dict[str, Any]:
+    """Read or set the Mini's speaker volume, 0-100.
 
-    Calls ``ReachyDriver.set_volume(level)`` once. The media rail is not
-    plumbed into the driver yet, so today this refuses by naming the accessor
-    to add.
+    With no ``level`` this reads the current volume through
+    ``ReachyDriver.get_volume()`` - a read, nothing plays. With a ``level`` it
+    calls ``ReachyDriver.set_volume(level, allow_test_sound=allow_test_sound)``,
+    and the daemon's setter ALSO plays a short test sound (``impatient1.wav``),
+    which can move the head when wobbling is on; the driver refuses the write
+    unless ``allow_test_sound`` is ``True``, so a volume change is never
+    mistaken for a silent setting.
 
     Args:
         driver: The live ReachyDriver handle the orchestrator constructed.
-        level: Volume, an integer from 0 to 100.
+        level: Target volume: an integer 0-100, or a word - ``silent``,
+            ``low``, ``normal``, ``loud``, ``max``, ``quieter``, ``louder``.
+            Omit it to read the current level instead.
+        allow_test_sound: Acknowledge the daemon's test sound. Required
+            ``True`` for a write; ignored for a read.
 
     Returns:
         The driver's envelope, success or refusal, unreshaped.
     """
+    if level is None:
+        refusal = _handle_refusal("reachy_volume", driver, accessor="get_volume")
+        if refusal is not None:
+            return refusal
+        return driver.get_volume()
     refusal = _handle_refusal("reachy_volume", driver)
     if refusal is not None:
         return refusal
-    if level is None:
-        return _refusal("reachy_volume: `level` is required. Pass an integer from 0 to 100.")
-    if isinstance(level, bool) or not isinstance(level, int):
-        return _refusal(f"reachy_volume: `level` must be an integer 0-100, got {type(level).__name__!r}.")
-    if not 0 <= level <= 100:
-        return _refusal(f"reachy_volume: `level` must be within 0-100, got {level}.")
-    return driver.set_volume(level)
+    if isinstance(level, bool) or not isinstance(level, int | str):
+        return _refusal(f"reachy_volume: `level` must be an integer 0-100 or a word, got {type(level).__name__!r}.")
+    if (reason := boolean_flag_error(allow_test_sound, "allow_test_sound", "reachy_volume")) is not None:
+        return _refusal(reason)
+    return driver.set_volume(level, allow_test_sound=allow_test_sound)
 
 
 @tool
 def reachy_camera(driver: Any, save_path: str = "") -> dict[str, Any]:
     """Capture a frame from the Mini's head camera and save it to disk.
 
-    Calls ``ReachyDriver.capture_frame(save_path)`` once. The media rail is
-    not plumbed into the driver yet, so today this refuses by naming the
-    accessor to add.
+    Calls ``ReachyDriver.capture_frame(save_path)`` once. Requires the native
+    GStreamer media service and local PyGObject/rswebrtc plugins. The driver
+    also exposes this as the JSON-callable ``camera`` action.
 
     Args:
         driver: The live ReachyDriver handle the orchestrator constructed.
@@ -474,27 +485,42 @@ def reachy_camera(driver: Any, save_path: str = "") -> dict[str, Any]:
 
 
 @tool
-def reachy_look_at(driver: Any, u: int | None = None, v: int | None = None) -> dict[str, Any]:
-    """Servo the Mini's head toward pixel ``(u, v)`` in its camera frame.
+def reachy_look_at(
+    driver: Any,
+    u: int | None = None,
+    v: int | None = None,
+    frame_width: int | None = None,
+    frame_height: int | None = None,
+    duration: float = 1.0,
+) -> dict[str, Any]:
+    """Turn the Mini's head toward pixel ``(u, v)`` of an unmodified camera frame.
 
-    Calls ``ReachyDriver.look_at_image(u, v)`` once. The media rail is not
-    plumbed into the driver yet, so today this refuses by naming the accessor
-    to add.
+    Calls ``ReachyDriver.look_at(u, v, frame_width, frame_height, duration=...)``
+    once: the driver reads the daemon's calibration and a fresh head pose,
+    plans the pose that puts the pixel on the head's forward axis, runs it
+    through the shared motion envelope and asks for one smooth move. The frame
+    size is required because the calibration is for the full sensor and the
+    stream is a crop of it; pass the frame's real dimensions, never a resized
+    preview's.
 
     Args:
         driver: The live ReachyDriver handle the orchestrator constructed.
-        u: Pixel column in the camera frame.
-        v: Pixel row in the camera frame.
+        u: Pixel column in the camera frame, from the left.
+        v: Pixel row in the camera frame, from the top.
+        frame_width: Width of the unmodified frame the pixel came from.
+        frame_height: Height of that frame.
+        duration: Seconds for the interpolated move.
 
     Returns:
-        The driver's envelope, success or refusal, unreshaped.
+        The driver's envelope, success or refusal, unreshaped. Success is the
+        daemon accepting the move, not the head having arrived.
     """
     refusal = _handle_refusal("reachy_look_at", driver)
     if refusal is not None:
         return refusal
-    for name, value in (("u", u), ("v", v)):
+    for name, value in (("u", u), ("v", v), ("frame_width", frame_width), ("frame_height", frame_height)):
         if value is None:
-            return _refusal(f"reachy_look_at: `{name}` is required. Pass the pixel coordinate in the camera frame.")
+            return _refusal(f"reachy_look_at: `{name}` is required. Pass the pixel and the unmodified frame size.")
         if isinstance(value, bool) or not isinstance(value, int):
-            return _refusal(f"reachy_look_at: `{name}` must be an integer pixel, got {type(value).__name__!r}.")
-    return driver.look_at_image(u, v)
+            return _refusal(f"reachy_look_at: `{name}` must be an integer, got {type(value).__name__!r}.")
+    return driver.look_at(u, v, frame_width, frame_height, duration=duration)
