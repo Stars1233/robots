@@ -37,6 +37,12 @@ from strands_robots.mesh import RosBridgedRobot, RosbridgeRobot, RtpsRobot
 ZERO_TWIST = {"linear": {"x": 0.0}, "angular": {"z": 0.0}}
 
 
+#: Forwarded arguments that carry the operator decision rather than the message.
+#: A gate is a fresh closure per call, so two calls of one method are never equal
+#: dicts while it is in them - and nothing in it reaches the robot.
+_OFF_THE_WIRE = frozenset({"gate", "tool_context"})
+
+
 class _Recorder:
     """Records the kwargs of each forwarded transport call."""
 
@@ -47,9 +53,14 @@ class _Recorder:
         self.calls.append(kwargs)
         return {"status": "success", "content": [{"text": "ok"}]}
 
+    @property
+    def on_the_wire(self) -> list[dict[str, Any]]:
+        """The recorded calls without the operator decision travelling beside them."""
+        return [{k: v for k, v in call.items() if k not in _OFF_THE_WIRE} for call in self.calls]
+
 
 def _ros(rec: _Recorder, monkeypatch: pytest.MonkeyPatch) -> Any:
-    monkeypatch.setattr(ros_mod, "use_ros", rec)
+    monkeypatch.setattr(ros_mod, "ros_action", rec)
     return RosBridgedRobot.from_ros(node_name="rover", cmd_vel_topic="/cmd_vel", odom_topic="/odom")
 
 
@@ -135,10 +146,10 @@ def test_the_ros2_stop_tool_forwards_to_the_instance_method(monkeypatch: pytest.
 
     rec.calls.clear()
     stop_tool()
-    via_tool = list(rec.calls)
+    via_tool = rec.on_the_wire
     rec.calls.clear()
     robot.stop()
-    assert via_tool == rec.calls
+    assert via_tool == rec.on_the_wire
 
 
 # The forwarding closures that were never invoked through the tool -------------
@@ -146,7 +157,7 @@ def test_the_ros2_stop_tool_forwards_to_the_instance_method(monkeypatch: pytest.
 
 def test_the_ros2_pose_and_scan_tools_forward_to_the_instance(monkeypatch: pytest.MonkeyPatch) -> None:
     rec = _Recorder()
-    monkeypatch.setattr(ros_mod, "use_ros", rec)
+    monkeypatch.setattr(ros_mod, "ros_action", rec)
     robot = RosBridgedRobot("rover", "/cmd_vel", "/odom", scan_topic="/scan")
     tools = _tools(robot)
 

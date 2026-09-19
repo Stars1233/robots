@@ -41,14 +41,14 @@ _READS: list[tuple[str, Any, str, Callable[[], Any], str]] = [
     (
         "ros_bridge",
         ros_bridge_mod,
-        "use_ros",
+        "ros_action",
         lambda: ros_bridge_mod.RosBridgedRobot("rover", "/cmd_vel", "/odom", scan_topic="/scan"),
         "get_pose",
     ),
     (
         "ros_bridge",
         ros_bridge_mod,
-        "use_ros",
+        "ros_action",
         lambda: ros_bridge_mod.RosBridgedRobot("rover", "/cmd_vel", "/odom", scan_topic="/scan"),
         "get_scan",
     ),
@@ -69,7 +69,7 @@ _READS: list[tuple[str, Any, str, Callable[[], Any], str]] = [
     (
         "ackermann",
         ackermann_mod,
-        "use_ros",
+        "ros_action",
         lambda: ackermann_mod.AckermannRosRobot("car", "/servo", scan_topic="/scan"),
         "get_scan",
     ),

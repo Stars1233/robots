@@ -37,6 +37,7 @@ from typing import Any
 
 import pytest
 
+import strands_robots.ros as ros_transport_mod
 import strands_robots.rosbridge as rosbridge_transport_mod
 import strands_robots.rtps.participant as participant_mod
 import strands_robots.tools.use_ros as ros_mod
@@ -59,7 +60,7 @@ def _texts(result: dict[str, Any]) -> str:
 @pytest.fixture(autouse=True)
 def _every_backend_available(monkeypatch: pytest.MonkeyPatch) -> None:
     """Default every transport to a present backend; opt out where needed."""
-    monkeypatch.setattr(ros_mod._backend, "available", lambda: True)
+    monkeypatch.setattr(ros_transport_mod._backend, "available", lambda: True)
     monkeypatch.setattr(participant_mod._backend, "available", lambda: True)
     monkeypatch.setattr(rosbridge_transport_mod._backend, "available", lambda: True)
 
@@ -97,9 +98,9 @@ def published_at(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     monkeypatch.setitem(sys.modules, "rosidl_runtime_py", package)
     monkeypatch.setitem(sys.modules, "rosidl_runtime_py.set_message", set_message)
 
-    monkeypatch.setattr(ros_mod._backend, "_ensure_node", lambda: FakeNode())
-    monkeypatch.setattr(ros_mod._backend, "spin_for", lambda predicate, timeout: None)
-    monkeypatch.setattr(ros_mod, "_get_message", lambda msg_type: object)
+    monkeypatch.setattr(ros_transport_mod._backend, "_ensure_node", lambda: FakeNode())
+    monkeypatch.setattr(ros_transport_mod._backend, "spin_for", lambda predicate, timeout: None)
+    monkeypatch.setattr(ros_transport_mod, "_get_message", lambda msg_type: object)
     return stamps
 
 
@@ -160,7 +161,7 @@ def test_a_refusal_names_the_option_even_with_no_ros_installed(
     A caller mistake must not be masked by an install hint on a machine without
     ROS 2 and then reported differently on a machine with it.
     """
-    monkeypatch.setattr(ros_mod._backend, "available", lambda: False)
+    monkeypatch.setattr(ros_transport_mod._backend, "available", lambda: False)
 
     result = _publish_twist(count=6, rate=0.0)
 
@@ -184,7 +185,7 @@ def test_publish_accepts_an_unusable_timeout_it_never_reads(published_at: list[f
 @pytest.mark.parametrize("action", ["status", "list_topics"])
 def test_an_action_reading_no_numeric_option_is_never_refused(monkeypatch: pytest.MonkeyPatch, action: str) -> None:
     """A query action must not fail for a value it does not look at."""
-    monkeypatch.setattr(ros_mod, "_list_topics", lambda: "/cmd_vel [geometry_msgs/msg/Twist]")
+    monkeypatch.setattr(ros_transport_mod, "_list_topics", lambda: "/cmd_vel [geometry_msgs/msg/Twist]")
 
     result = ros_mod.use_ros(action=action, count=-1, rate=float("nan"), timeout=-1.0)
 
