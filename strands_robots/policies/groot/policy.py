@@ -638,8 +638,21 @@ class Gr00tPolicy(Policy):
         language_key: str | None = None,
         strict_keys: bool = False,
         timeout_ms: int = 15000,
-        **kwargs,
+        **ignored_kwargs: Any,
     ):
+        # Nothing below reads the sink. It exists so a shared ``policy_config``
+        # can carry another provider's keys, but a key that lands here was not
+        # a parameter this policy has, so its value is never applied and the
+        # default stands. Naming the keys is what ``LerobotLocalPolicy`` and
+        # ``LerobotAsyncPolicy`` do at the same door; dropping them silently
+        # built a policy on the defaults with no line saying the request was
+        # never read.
+        if ignored_kwargs:
+            logger.warning(
+                "Gr00tPolicy ignoring unexpected constructor kwarg(s) %s; none of them is a "
+                "parameter this policy reads, so the defaults stand for whatever they meant.",
+                sorted(ignored_kwargs),
+            )
         self.data_config = load_data_config(data_config)
         self.data_config_name = data_config if isinstance(data_config, str) else type(data_config).__name__
 
