@@ -329,6 +329,31 @@ def _seal(cmd: Any) -> str | None:
     return None
 
 
+def _soft_frame() -> tuple[Any, str | None]:
+    """Return an unsealed ``LowCmd_`` with the twelve driven slots enabled at zero gain.
+
+    The shape both write paths build on: ``mode`` is :data:`_MOTOR_MODE_SERVO`
+    and ``q``/``dq``/``tau``/``kp``/``kd`` are ``0.0`` on every
+    :data:`GO2_JOINT_INDEX` slot, so a slot nothing overwrites holds no
+    position and applies no torque but is never *disabled*. The caller seals.
+
+    Returns:
+        ``(cmd, None)`` on success, ``(None, reason)`` when the SDK is absent.
+    """
+    cmd, err = _new_lowcmd()
+    if err is not None:
+        return None, err
+    for slot in GO2_JOINT_INDEX.values():
+        motor = cmd.motor_cmd[slot]
+        motor.mode = _MOTOR_MODE_SERVO
+        motor.q = 0.0
+        motor.dq = 0.0
+        motor.tau = 0.0
+        motor.kp = 0.0
+        motor.kd = 0.0
+    return cmd, None
+
+
 def build_lowcmd_from_action(action: dict[str, Any]) -> tuple[Any, str | None]:
     """Build a Go2 ``LowCmd_`` from a caller's :meth:`Go2Driver.send_action` dict.
 
@@ -356,11 +381,13 @@ def build_lowcmd_from_action(action: dict[str, Any]) -> tuple[Any, str | None]:
       target off the wire, and refusing the whole action is the same posture an
       unknown joint name gets, for the same reason.
 
-    Wire-frame contract: the header and ``level_flag`` come from
-    :func:`_new_lowcmd`; ``motor_cmd[i].mode`` is set to
-    :data:`_MOTOR_MODE_SERVO` on every commanded slot, because an unset mode
-    byte commands nothing however valid the CRC; untouched slots keep their zero
-    default and stay disabled; and :func:`_seal` writes the CRC last.
+    Wire-frame contract: the frame starts as :func:`_soft_frame` (header and
+    ``level_flag`` from :func:`_new_lowcmd`, every driven slot enabled at zero
+    gain), so a joint the action omits is *not* disabled - a Disable byte on a
+    standing robot cuts that motor dead, exactly the frame
+    :func:`build_zero_torque_lowcmd` exists to avoid, and the SDK's own Go2
+    example enables all twenty slots on every frame. Commanded slots then get
+    their targets and gains, and :func:`_seal` writes the CRC last.
 
     Args:
         action: Joint-name-keyed targets.
@@ -373,7 +400,7 @@ def build_lowcmd_from_action(action: dict[str, Any]) -> tuple[Any, str | None]:
         return None, f"action must be a dict, got {type(action).__name__}"
     if not action:
         return None, "action is empty; nothing to command"
-    cmd, err = _new_lowcmd()
+    cmd, err = _soft_frame()
     if err is not None:
         return None, err
     known_inner = set(_WIRE_FIELDS)
@@ -430,17 +457,9 @@ def build_zero_torque_lowcmd() -> tuple[Any, str | None]:
     Returns:
         ``(cmd, None)`` on success, ``(None, reason)`` when the SDK is absent.
     """
-    cmd, err = _new_lowcmd()
+    cmd, err = _soft_frame()
     if err is not None:
         return None, err
-    for slot in GO2_JOINT_INDEX.values():
-        motor = cmd.motor_cmd[slot]
-        motor.mode = _MOTOR_MODE_SERVO
-        motor.q = 0.0
-        motor.dq = 0.0
-        motor.tau = 0.0
-        motor.kp = 0.0
-        motor.kd = 0.0
     if (err := _seal(cmd)) is not None:
         return None, err
     return cmd, None
