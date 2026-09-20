@@ -567,8 +567,8 @@ class CuroboPolicy(Policy):
 
         Raises:
             ValueError: If neither structured goal nor a parseable
-                ``instruction`` is provided, or if the goal payload is
-                malformed.
+                ``instruction`` is provided, if both ``target_pose`` and
+                ``target_joints`` are, or if the goal payload is malformed.
             RuntimeError: If cuRobo returns ``success=False`` (no
                 collision-free path).
         """
@@ -580,6 +580,18 @@ class CuroboPolicy(Policy):
 
         if target_pose is None and target_joints is None:
             target_pose, target_joints = self._parse_target(instruction)
+
+        # Two goals name two different plans - a Cartesian one and a
+        # joint-space one - and picking one silently planned whichever this
+        # branch happened to test first while the caller believed the other
+        # was in force (the MoveIt2 twin picks the opposite). Refuse, as the
+        # constructor refuses a kwarg beside its own alias.
+        if target_pose is not None and target_joints is not None:
+            raise ValueError(
+                "CuroboPolicy.get_actions: pass exactly one of target_pose= "
+                "(Cartesian goal) or target_joints= (joint-space goal), not both - "
+                "they name two different plans and neither takes precedence."
+            )
 
         if target_pose is None and target_joints is None:
             raise ValueError(

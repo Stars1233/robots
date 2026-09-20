@@ -254,6 +254,24 @@ class TestCuroboPolicyValidation:
                 )
             )
 
+    def test_both_goals_refused_and_nothing_planned(self) -> None:
+        """target_pose= beside target_joints= names two plans; neither is picked.
+
+        On main the Cartesian branch ran and the joint goal vanished: a plan
+        came back and the stub recorded a ``plan_single`` call.
+        """
+        p = self._make_policy()
+        with pytest.raises(ValueError, match="exactly one of target_pose"):
+            asyncio.run(
+                p.get_actions(
+                    {"observation.state": [0.0] * 6},
+                    "",
+                    target_pose=[0.5, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0],
+                    target_joints={"joint_0": 0.1},
+                )
+            )
+        assert p._motion_planner.plan_calls == []
+
     def test_target_joints_non_dict_rejected(self) -> None:
         p = self._make_policy()
         with pytest.raises(ValueError, match="must be a dict"):

@@ -95,7 +95,8 @@ so a goal can flow across providers without coupling to a backend:
 | `world_update` | `dict \| None` | Per-call collision-scene refresh |
 | `replan` | `bool` | Force a fresh plan even if cached waypoints remain |
 
-Pass exactly one of `target_pose` / `target_joints`. When neither is given,
+Pass exactly one of `target_pose` / `target_joints`; both at once is refused
+with a `ValueError`, since they name two different plans. When neither is given,
 the policy makes a best-effort parse of a JSON `target_pose` / `target_joints`
 payload embedded in the instruction (for LLM-agent flows); if none is found it
 raises `ValueError`. Each `{...}` object in the instruction is decoded on its
