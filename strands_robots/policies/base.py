@@ -343,6 +343,14 @@ class Policy(ABC):
     #: ``start`` reports before the executor thread builds the policy.
     reads_instruction: ClassVar[bool] = True
 
+    #: What the actions of a policy with ``reads_instruction = False`` are, in
+    #: the words the task envelope uses to describe them - ``"a test motion on
+    #: every joint"`` for :class:`~strands_robots.policies.mock.MockPolicy`.
+    #: Read only when ``reads_instruction`` is ``False``; ``None`` (the
+    #: default) makes the notice say the actions were commanded and describe
+    #: no motion, so a custom non-reader is not described as the mock.
+    instruction_free_actions: ClassVar[str | None] = None
+
     @property
     def required_bodies(self) -> tuple[str, ...]:
         """Named rigid bodies whose world pose this policy needs in its observation.
@@ -509,16 +517,19 @@ def instruction_not_read_notice(policy: object, *, pending: bool = False) -> str
     if getattr(policy, "reads_instruction", True):
         return None
     name = policy.__name__ if isinstance(policy, type) else type(policy).__name__
+    # The clause is the class's own description of its actions; a class that
+    # declares none gets no clause rather than the mock's sinusoid.
+    described = getattr(policy, "instruction_free_actions", None)
+    actions = f"Its actions - {described} -" if described else "Its actions"
     if pending:
         return (
-            f"Note: {name} does not read the instruction. Its actions - a test motion on "
-            "every joint - are commanded to the robot whatever the task says; no status or "
-            "completion that follows will mean the task was performed."
+            f"Note: {name} does not read the instruction. {actions} are commanded to the "
+            "robot whatever the task says; no status or completion that follows will mean "
+            "the task was performed."
         )
     return (
-        f"Note: {name} does not read the instruction. Its actions - a test "
-        "motion on every joint - were commanded to the robot whatever the task says; nothing "
-        "above means the task was performed."
+        f"Note: {name} does not read the instruction. {actions} were commanded to the "
+        "robot whatever the task says; nothing above means the task was performed."
     )
 
 

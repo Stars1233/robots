@@ -85,6 +85,7 @@ implemented by it.
 | `set_rtc_observed_delay(steps)` | no | records the delay |
 | `rtc_observed_delay_steps` (attribute) | no | `None` |
 | `reads_instruction` (class attribute) | no | `True` - declare `False` when the instruction never shapes the actions (the task envelopes then say so) |
+| `instruction_free_actions` (class attribute) | no | `None` - with `reads_instruction = False`, the words the envelope uses for your actions (`"a test motion on every joint"` on the mock); `None` names no motion |
 
 `preflight` is the fail-fast seam: the simulation calls it on your **class**,
 before `create_policy` constructs anything and therefore before any weight
