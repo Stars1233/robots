@@ -217,3 +217,42 @@ def _optional_module_memo_holds_no_stand_in() -> Iterator[None]:
     if memo is not None and memo != before:
         memo.clear()
         memo.update(before)
+
+
+@pytest.fixture(autouse=True)
+def _predicate_registry_is_left_as_found() -> Iterator[None]:
+    """Leave the predicate registry holding only what the session started with.
+
+    ``strands_robots.simulation.predicates.PREDICATE_REGISTRY`` is a
+    process-global dict, and :func:`register_predicate` is the documented way
+    to extend it. A test that registers one leaves it there for every later
+    test in the process, and a grader that reads the registry as the set of
+    shipped predicates then fails on a name that only a test knows.
+
+    Measured with ``tests/test_fleet_emergency_evacuation.py`` running ahead of
+    ``tests/simulation/test_predicate_docstring_completeness.py`` (the ordering
+    ``--dist loadfile`` produces and a serial run does not): the example under
+    test registers ``evacuation_abort_within``, and the docstring grader read it
+    as drift - ``bool docstring drift: missing=['evacuation_abort_within']``.
+
+    Seven call sites used to undo their own registration in a ``try``/
+    ``finally``; the session owns it now, so a registration is one line again
+    and the one path that forgot is covered too.
+
+    The module is imported here rather than looked up in ``sys.modules`` the way
+    the ``_lazy_modules`` memo above is: that memo is born empty, this registry
+    is born holding the 30 shipped predicates. A lookup that misses the module -
+    which is what happens whenever nothing imported it at collection time, as in
+    ``pytest tests/test_fleet_emergency_evacuation.py`` alone, where the example
+    under test imports it inside a test - would take an empty baseline and this
+    teardown would then wipe the shipped set for the rest of the process, leaving
+    every later cell on ``Unknown predicate 'inside_region'``. The import costs
+    0.1 s once and pulls in stdlib plus :mod:`strands_robots.utils` only.
+    """
+    from strands_robots.simulation import predicates
+
+    before = dict(predicates.PREDICATE_REGISTRY)
+    yield
+    if predicates.PREDICATE_REGISTRY != before:
+        predicates.PREDICATE_REGISTRY.clear()
+        predicates.PREDICATE_REGISTRY.update(before)
