@@ -168,10 +168,10 @@ client never unpickles a reply.
 ```
 so100               so100_dualcam          so100_4cam
 so101               so101_dualcam          so101_tricam
-bimanual_panda_gripper                     single_panda_gripper
-libero_panda        oxe_droid              oxe_widowx
-oxe_google          fourier_gr1_arms_only  fourier_gr1_arms_waist
-fourier_gr1_full_upper_body
+bimanual_panda_gripper  bimanual_panda_hand  single_panda_gripper
+libero_panda        oxe_droid              oxe_droid_relative_eef_relative_joint
+oxe_widowx          oxe_google             fourier_gr1_arms_only
+fourier_gr1_arms_waist                     fourier_gr1_full_upper_body
 unitree_g1          unitree_g1_full_body   unitree_g1_locomanip
 unitree_g1_real     unitree_g1_sonic
 agibot_*            galaxea_r1_pro
