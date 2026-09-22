@@ -3121,11 +3121,17 @@ class LerobotLocalPolicy(Policy):
 
         Idempotent: a fully LeRobot-formatted observation is returned unchanged.
         """
-        # Already LeRobot-formatted? (any observation.* key) → pass through.
-        if any(k.startswith("observation.") for k in observation_dict):
+        # Already LeRobot-formatted? (EVERY key an observation.* feature or
+        # ``task``) → pass through. The exit used to fire on ANY prefixed key,
+        # so a mixed observation - ``observation.state`` beside a bare camera
+        # ``top`` - skipped the camera routing below and lerobot raised a bare
+        # ``KeyError: 'observation.images.top'``. The rule above is per key:
+        # prefixed keys pass through, bare cameras still bind by name.
+        passthrough = {k: v for k, v in observation_dict.items() if k == "task" or k.startswith("observation.")}
+        if len(passthrough) == len(observation_dict):
             return dict(observation_dict)
 
-        out: dict[str, Any] = {}
+        out: dict[str, Any] = dict(passthrough)
 
         declared_img_feats = [f for f, feat in self._input_features.items() if _declared_feature_is_image(f, feat)]
 
@@ -3137,8 +3143,12 @@ class LerobotLocalPolicy(Policy):
         #    (MolmoAct2 etc.) too, so the strict_keys remedy advertised below
         #    ("Provide an explicit mapping (camera_key_map)") actually fixes the
         #    failure it points at instead of being silently ignored.
-        image_items = [(k, v) for k, v in observation_dict.items() if isinstance(v, np.ndarray) and v.ndim >= 2]
-        used_feats: set[str] = set()
+        image_items = [
+            (k, v)
+            for k, v in observation_dict.items()
+            if k not in passthrough and isinstance(v, np.ndarray) and v.ndim >= 2
+        ]
+        used_feats: set[str] = {f for f in declared_img_feats if f in passthrough}
         unmatched_imgs = []
         # 1a) The explicit map is applied over the WHOLE observation before any
         #     exact-name match runs. Resolving it inside the single loop below
@@ -3230,7 +3240,10 @@ class LerobotLocalPolicy(Policy):
                 f"Add the missing camera(s) to the observation or pass camera_key_map."
             )
 
-        # 2) Collect scalar joint values into observation.state.
+        # 2) Collect scalar joint values into observation.state - unless the
+        #    caller already supplied the composed vector.
+        if "observation.state" in out:
+            return out
         scalar_keys = observed_state_keys(observation_dict)
         # Resolve the joint-state ordering, raising/warning loudly when the
         # configured robot_state_keys cannot describe this observation (the
