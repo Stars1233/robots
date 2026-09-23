@@ -789,11 +789,14 @@ class TestTheAgentSurface:
         driver = _live_driver(session)
         answer = self._invoke(driver, action="move", linear=0.3, duration_s=0.01)
         assert answer["status"] == "success"
-        assert answer["content"][0]["json"] == {
-            "commanded": {"linear": 0.3, "angular": 0.0},
-            "held_s": 0.01,
-            "stopped": True,
-        }
+        outcome = answer["content"][0]["json"]
+        assert set(outcome) == {"commanded", "held_s", "stopped"}
+        assert outcome["commanded"] == {"linear": 0.3, "angular": 0.0}
+        assert outcome["stopped"] is True
+        # held_s is the hold the driver measured, not the duration it was asked
+        # for: sleeping never returns early, so the measurement always passes
+        # the request rather than equalling that float.
+        assert 0.01 < outcome["held_s"] < 1.0
         assert [post[1]["command"] for post in session.posts] == [
             {"linear": 0.3, "angular": 0.0},
             {"linear": 0.0, "angular": 0.0},
