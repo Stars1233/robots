@@ -42,9 +42,18 @@ and exits non-zero on a hard error so it can gate CI behind real weights.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 import numpy as np
+
+# Chosen at module scope, before anything in this file imports mujoco: MuJoCo
+# reads MUJOCO_GL once, at that import, and binds its GL backend there. With
+# nothing having chosen by then a headless Linux host is left on the windowed
+# "glfw" backend, where no context can be created and rendering silently
+# produces nothing. Guarded because neither value works on both platforms:
+# "egl" is not in MuJoCo's accepted set on macOS and "cgl" cannot render off it.
+os.environ.setdefault("MUJOCO_GL", "cgl" if sys.platform == "darwin" else "egl")
 
 
 def _build_torque_g1() -> tuple:

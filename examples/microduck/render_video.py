@@ -72,9 +72,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
+
+# Chosen at module scope, before anything in this file imports mujoco: MuJoCo
+# reads MUJOCO_GL once, at that import, and binds its GL backend there. With
+# nothing having chosen by then a headless Linux host is left on the windowed
+# "glfw" backend, where no context can be created and rendering silently
+# produces nothing. Guarded because neither value works on both platforms:
+# "egl" is not in MuJoCo's accepted set on macOS and "cgl" cannot render off it.
+os.environ.setdefault("MUJOCO_GL", "cgl" if sys.platform == "darwin" else "egl")
 
 BASE_BODY = "microduck/trunk_base"
 
@@ -352,9 +361,7 @@ def _placement_report(args, foot: str, placed: tuple[float, float] | None) -> st
     if placed is not None:
         return f"  ball placed at ({placed[0]:.3f}, {placed[1]:.3f}) in front of the {foot} foot"
     if getattr(args, "kick_foot", None):
-        raise SystemExit(
-            f"--kick-foot {foot}: the scene carries no {BALL_JOINT!r} joint; pass --scene scene_ball.xml"
-        )
+        raise SystemExit(f"--kick-foot {foot}: the scene carries no {BALL_JOINT!r} joint; pass --scene scene_ball.xml")
     return (
         f"  no {BALL_JOINT!r} joint in this scene: the {foot}-foot kick swings at nothing; "
         "pass --scene scene_ball.xml for the geometry the weight was trained on"

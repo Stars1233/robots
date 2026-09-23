@@ -481,3 +481,156 @@ class TestAGuardIsRecognisedHoweverTheLineNamesMacOS:
         assert _scan_py(path) == ['os.environ.setdefault("MUJOCO_GL", "cgl")']
         assert _unguarded_platform_bound_defaults(source) == ["line 2: 'cgl'"]
         assert not _is_guarded('"cgl"')
+
+
+def _first_import_of(source: str, top_level: str) -> int | None:
+    """Line of the earliest import whose top-level module is ``top_level``."""
+    earliest: int | None = None
+    for node in ast.walk(ast.parse(source)):
+        names: list[str] = []
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names = [node.module]
+        if any(name.split(".")[0] == top_level for name in names):
+            line = getattr(node, "lineno", 0)
+            if earliest is None or line < earliest:
+                earliest = line
+    return earliest
+
+
+def _gl_backend_locked_before_it_is_chosen(source: str) -> str | None:
+    """The reason a file's GL backend is fixed before anything selects it.
+
+    ``import mujoco`` is the locking event and the only one: MuJoCo reads
+    ``MUJOCO_GL`` once, there, and :mod:`mujoco.rendering.classic.gl_context` binds
+    ``GLContext`` at that moment - setting the variable afterwards changes nothing.
+
+    Two things count as having chosen by then, and a file needs either:
+
+    * its own ``os.environ.setdefault("MUJOCO_GL", ...)``, or
+    * any ``strands_robots`` import, because the package root runs
+      ``_mujoco_gl._configure_gl_backend()`` eagerly and that selector picks ``egl``
+      (or ``osmesa``) on a headless Linux host, with the NVIDIA-ICD guarantee.
+
+    An import of ``strands_robots`` is therefore a REMEDY here rather than a second
+    hazard, which is the distinction the first draft of this rule got wrong: it
+    treated both imports as locking and reported
+    ``examples/isaac_gs/app.py`` and ``examples/kimodo/kimodo_g1_dataset_headcam.py``,
+    neither of which imports ``mujoco`` at all. Their later ``setdefault`` is a
+    redundant no-op because the selector already ran - correct code, and exactly
+    what a position rule must not flag.
+
+    A file that never imports ``mujoco`` is out of scope, and so is one that
+    declares no default and imports ``strands_robots`` first: that is the ordinary
+    arrangement most examples use.
+    """
+    mujoco_line = _first_import_of(source, "mujoco")
+    if mujoco_line is None:
+        return None
+    chosen_by: list[int] = [line for line, _ in _all_scope_gl_defaults(source) if line < mujoco_line]
+    strands_line = _first_import_of(source, "strands_robots")
+    if strands_line is not None and strands_line < mujoco_line:
+        chosen_by.append(strands_line)
+    if chosen_by:
+        return None
+    defaults = [line for line, _ in _all_scope_gl_defaults(source)]
+    where = f"its own default is at line {min(defaults)}" if defaults else "it sets no default"
+    suffix = f", and 'strands_robots' is imported at line {strands_line}" if strands_line else ""
+    return f"'mujoco' is imported at line {mujoco_line}, but {where}{suffix}"
+
+
+def test_an_example_chooses_its_gl_backend_before_mujoco_locks_it():
+    """Rule 4: position, not value. The other three grade WHICH backend a default
+    names; none grades WHETHER anything had chosen by the time it was fixed.
+
+    MuJoCo reads ``MUJOCO_GL`` exactly once, at the first ``import mujoco``. An
+    example that reaches that import with neither its own default nor a
+    ``strands_robots`` import behind it is left on MuJoCo's own default, ``glfw`` -
+    a windowed backend, which on a headless Linux host cannot create a context at
+    all.
+
+    The failure is silent at the import and surfaces frames later as a render that
+    produces nothing, which is why it needs a structural pin rather than review.
+    Measured on ``7cbd6bd``: ``examples/vla/cosmos3_diffusers_mujoco_rollout.py``
+    imported ``mujoco`` at line 47 with its default at 104 and its first
+    ``strands_robots`` import at 53, so the eager selector's ``MUJOCO_GL=egl`` - and
+    the NVIDIA-ICD guarantee with it - arrived after the backend was bound (#3954).
+    """
+    offenders = {
+        str(path.relative_to(_REPO_ROOT)): reason
+        for path in _example_py()
+        if (reason := _gl_backend_locked_before_it_is_chosen(path.read_text(encoding="utf-8")))
+    }
+    assert not offenders, (
+        "an example imports mujoco before anything has chosen a GL backend, so MuJoCo binds its "
+        "own default 'glfw' and a headless host cannot render. Set "
+        'os.environ.setdefault("MUJOCO_GL", "cgl" if sys.platform == "darwin" else "egl") above '
+        f"the first 'import mujoco', or import strands_robots before it. Offending files: {offenders}"
+    )
+
+
+class TestThePositionRuleSeparatesTooLateFromInTime:
+    """Planted sources for Rule 4, weighted toward the shapes it must NOT report."""
+
+    def test_a_default_after_import_mujoco_is_reported(self):
+        source = 'import mujoco\nimport os\n\n\ndef main():\n    os.environ.setdefault("MUJOCO_GL", "egl")\n'
+
+        assert _gl_backend_locked_before_it_is_chosen(source) is not None
+
+    def test_the_measured_regression_shape_is_reported(self):
+        """#3954 exactly: mujoco first, then strands_robots, then the default."""
+        source = (
+            "import os\nimport sys\n\n\ndef main():\n    import mujoco\n\n"
+            "    from strands_robots.policies.cosmos3 import Cosmos3Policy\n\n"
+            '    os.environ.setdefault("MUJOCO_GL", "cgl" if sys.platform == "darwin" else "egl")\n'
+        )
+
+        assert _gl_backend_locked_before_it_is_chosen(source) is not None
+
+    def test_a_default_before_the_import_is_accepted(self):
+        source = (
+            "import os\nimport sys\n\n\ndef main():\n"
+            '    os.environ.setdefault("MUJOCO_GL", "cgl" if sys.platform == "darwin" else "egl")\n'
+            "    import mujoco\n"
+        )
+
+        assert _gl_backend_locked_before_it_is_chosen(source) is None
+
+    def test_a_strands_robots_import_first_is_accepted_with_no_default(self):
+        """The selector chose, so the file owes no default of its own."""
+        source = "from strands_robots import Simulation\n\nimport mujoco\n"
+
+        assert _gl_backend_locked_before_it_is_chosen(source) is None
+
+    def test_a_redundant_default_after_a_strands_robots_import_is_accepted(self):
+        """The shape the first draft wrongly reported: the selector already ran, so
+        the later setdefault is a no-op rather than a defect."""
+        source = (
+            "import os\nimport sys\n\nfrom strands_robots.rendering import mjpeg_frames\n\nimport mujoco\n\n\n"
+            'def main():\n    os.environ.setdefault("MUJOCO_GL", "cgl" if sys.platform == "darwin" else "egl")\n'
+        )
+
+        assert _gl_backend_locked_before_it_is_chosen(source) is None
+
+    def test_a_file_that_never_imports_mujoco_is_out_of_scope(self):
+        source = 'import os\n\n\ndef main():\n    os.environ.setdefault("MUJOCO_GL", "egl")\n'
+
+        assert _gl_backend_locked_before_it_is_chosen(source) is None
+
+    def test_a_submodule_import_of_strands_robots_still_counts_as_choosing(self):
+        """Importing any submodule runs the package root, hence the selector."""
+        source = "from strands_robots.policies.cosmos3 import Cosmos3Policy\n\nimport mujoco\n"
+
+        assert _gl_backend_locked_before_it_is_chosen(source) is None
+
+    def test_a_from_mujoco_import_locks_it_too(self):
+        source = 'import os\n\nfrom mujoco import MjModel\n\nos.environ.setdefault("MUJOCO_GL", "egl")\n'
+
+        assert _gl_backend_locked_before_it_is_chosen(source) is not None
+
+    def test_the_scan_reaches_the_examples(self):
+        """Non-vacuity: examples that import mujoco directly exist to be graded."""
+        importing = [p for p in _example_py() if _first_import_of(p.read_text(encoding="utf-8"), "mujoco") is not None]
+
+        assert importing, "no example imports mujoco directly; this rule has stopped measuring"

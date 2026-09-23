@@ -28,6 +28,7 @@ headless rollout attached to PR #458.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 import numpy as np
@@ -41,6 +42,17 @@ def main() -> int:
     ap.add_argument("--steps", type=int, default=35, help="diffusion sampling steps")
     ap.add_argument("--render", default=None, metavar="MP4", help="write a side-by-side rollout video here")
     args = ap.parse_args()
+
+    # Chosen BEFORE the first ``import mujoco``, which is when MuJoCo reads
+    # ``MUJOCO_GL`` and locks its GL backend for the whole process. A default set
+    # after that point cannot take effect - including the one
+    # ``strands_robots._mujoco_gl._configure_gl_backend()`` would set, which the
+    # package root runs eagerly on the first ``strands_robots`` import below. With
+    # mujoco imported first, that selector runs too late and a headless Linux host
+    # with nothing exported is left on the windowed ``glfw`` backend, where
+    # ``mujoco.Renderer`` cannot make a context and ``--render`` fails. Same
+    # placement as the sibling ``cosmos3_sim_rollout.py``.
+    os.environ.setdefault("MUJOCO_GL", "cgl" if sys.platform == "darwin" else "egl")
 
     # Imported before the forward pass on purpose: a missing distribution then
     # costs a second, not the minutes the pipeline load and sampling take.
@@ -99,9 +111,6 @@ def main() -> int:
 
     # 3) Optional: render MuJoCo arm tracking the trajectory, side-by-side with Cosmos world.
     if args.render:
-        import os
-
-        os.environ.setdefault("MUJOCO_GL", "cgl" if sys.platform == "darwin" else "egl")
         import imageio.v3 as iio
         from PIL import Image
 
