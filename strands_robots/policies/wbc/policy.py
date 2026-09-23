@@ -623,15 +623,26 @@ class WBCPolicy(Policy):
         (an upright stance cue) rather than fabricating motion.
 
         Velocity availability: WBC is a velocity-feedback balance controller, so
-        ``dqj`` and ``base_ang_vel`` are genuine inputs - not optional. Both sim
-        backends' unified observation pairs each joint position with a
-        ``<name>.vel`` reading, so a plain ``sim.run_policy`` rollout closes the
-        velocity loop. An observation that carries neither those keys nor
-        ``observation.velocity`` / ``base_ang_vel`` (a hardware or teleop bridge
-        that reports positions only) feeds WBC zeros for dqj/base_ang_vel; we
-        emit a one-time warning when that happens (a dead velocity channel can
-        destabilise the gait) rather than silently pretending the controller is
-        fully observed.
+        ``dqj`` and ``base_ang_vel`` are genuine inputs - not optional. EVERY
+        sim backend's unified observation now pairs each joint position with a
+        per-joint ``<name>.vel`` reading (the ``SimEngine.get_observation``
+        schema documents them; MuJoCo has emitted them since #761, Newton and
+        Isaac since the changes that corrected this paragraph), so a plain
+        ``sim.run_policy`` rollout closes the velocity loop. "Every" rather than
+        "both": ``create_simulation`` resolves three backends, so a count here
+        goes stale the moment one is added - which is what this sentence is
+        being corrected for a second time.
+
+        This docstring used to claim the opposite - that the MuJoCo observation
+        exposes positions only - which sent anyone diagnosing a zero-velocity
+        gait toward the backend that was fine. An observation carrying neither
+        those keys nor ``observation.velocity`` / ``base_ang_vel`` (a hardware
+        or teleop bridge that reports positions only, an old recorded dataset)
+        feeds WBC zeros for dqj/base_ang_vel; the one-time warning below fires
+        when that happens, because a dead velocity channel can destabilise the
+        gait and silence would pretend the controller is fully observed. Those
+        are the three things :meth:`_observation_has_velocity` actually tests,
+        so the list is the code's rather than a paraphrase.
         """
         # qj/dqj observe the whole body (n_obs_joints), in WBC_G1_ALL_JOINTS order.
         obs_names = self._obs_joint_names

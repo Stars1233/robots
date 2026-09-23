@@ -387,6 +387,12 @@ class DomainRandomizationMixin:
         ``_apply_obs_noise``. A no-op (returns the input unchanged) when
         neither std is positive.
 
+        The split is not optional: this used to apply ``joint_pos_std`` to every
+        entry it was handed, which was correct only while the dict held nothing
+        but positions - and it meant the ``joint_vel_std`` that
+        :meth:`set_obs_noise` has accepted and documented all along configured a
+        channel that did not exist.
+
         Args:
             obs: Mapping of joint name to position (radians) and
                 ``<joint>.vel`` to velocity (rad/s).

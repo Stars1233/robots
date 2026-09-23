@@ -1229,20 +1229,30 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
                     # Velocity companion (``<name>.vel``), read from joint_qd via
                     # the per-joint DOF index - the two indices differ once a
                     # robot has a multi-coordinate joint, so the position index
-                    # cannot be reused. Emitted for every position entry (0.0
-                    # when the DOF index is unavailable, as get_robot_state
-                    # reports it) because a velocity-feedback policy reads the
-                    # pair BY NAME: the MicroduckPolicy observation builder
-                    # indexes obs[f"{joint}.vel"] for all 14 joints, and WBC /
-                    # ProtoMotions read the same spelling. Without it a
-                    # locomotion policy that runs on the MuJoCo backend raised
-                    # KeyError on the first tick here.
+                    # cannot be reused. Concretely, a free joint upstream shifts
+                    # them apart by one entry per joint (7 position coordinates
+                    # against 6 velocity DOFs), which is the whole reason the
+                    # second map exists. The free joint itself is skipped above;
+                    # its own twist is surfaced as ``base_lin_vel`` /
+                    # ``base_ang_vel``.
+                    #
+                    # INSIDE the position branch, and emitted for every position
+                    # entry (0.0 when the DOF index is unavailable, as
+                    # get_robot_state reports it), because a velocity-feedback
+                    # policy reads the pair BY NAME: the MicroduckPolicy
+                    # observation builder indexes obs[f"{joint}.vel"] for all 14
+                    # joints, and WBC / ProtoMotions read the same spelling.
+                    # Without it a locomotion policy that runs on the MuJoCo
+                    # backend raised KeyError on the first tick here. Keeping the
+                    # two in one branch is what makes "every position has a
+                    # velocity" true rather than usually true.
                     d_idx = self._joint_dof_index.get((robot_name, jname))
                     obs[f"{jname}.vel"] = float(joint_qd[d_idx]) if d_idx is not None and d_idx < len(joint_qd) else 0.0
-        # Joint sensor noise applies only to the float joint entries (positions
-        # and their ``.vel`` companions, each on its own std); camera frames are
-        # added afterwards (and carry their own jitter via the render path), so
-        # the result holds mixed float/ndarray values.
+        # Joint sensor noise applies only to the float joint entries -
+        # ``joint_pos_std`` to positions, ``joint_vel_std`` to the ``.vel``
+        # companions, split by suffix inside the helper; camera frames are added
+        # afterwards (and carry their own jitter via the render path), so the
+        # result holds mixed float/ndarray values.
         obs_out: dict[str, Any] = dict(self._apply_joint_noise(obs))
         # Floating-base IMU-style signals for a robot with a free root (a
         # humanoid / mobile base): ``base_quat`` (orientation, w,x,y,z) and
