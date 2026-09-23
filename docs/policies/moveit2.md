@@ -10,7 +10,8 @@ is a thin ZMQ + msgpack client for a sidecar ROS 2 node running
 [cuRobo](curobo.md) it is a **non-VLA, collision-aware motion planner**: it
 reads its goal from `**kwargs` (`target_pose` / `target_joints`), ignores
 camera frames (`requires_images = False`), and never parses the instruction
-string for control.
+string for control (`reads_instruction = False`, so the `run_policy`
+envelope says so).
 
 Unlike cuRobo's in-process CUDA library, MoveIt2 runs **out-of-process**: the
 ROS 2 stack and `moveit_py` live entirely in a sidecar, so the Python venv
@@ -38,8 +39,8 @@ python -m strands_robots.policies.moveit2.server.zmq_node \
 ```
 
 `--moveit-config-package` / `--robot-name` default to the panda config MoveIt 2
-ships, so the command above plans out of the box on planning group `panda_arm`;
-point both at your own config package for your robot. Install `pyzmq` +
+ships, so the command above plans `panda_arm` out of the box; point both at
+your own config package. Install `pyzmq` +
 `msgpack` into the interpreter that launches the sidecar.
 
 See [`policies/moveit2/server/README.md`](https://github.com/strands-labs/robots/blob/main/strands_robots/policies/moveit2/server/README.md)

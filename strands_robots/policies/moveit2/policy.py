@@ -39,7 +39,7 @@ from __future__ import annotations
 import logging
 import math
 import os
-from typing import Any
+from typing import Any, ClassVar
 
 from strands_robots.policies._log_safety import sanitize_log_value
 from strands_robots.policies._state_keys import joint_positions_from_observation
@@ -108,6 +108,13 @@ class MoveIt2Policy(Policy):
             policy = create_policy("moveit", port=5556)  # alias
             policy = create_policy("zmq://127.0.0.1:5556", planning_group="arm")
     """
+
+    #: ``False``: the planner reads its goal from ``target_pose`` /
+    #: ``target_joints`` and never parses the instruction, so the task
+    #: envelopes say the words they echo were never read.
+    reads_instruction: ClassVar[bool] = False
+    #: The words the task envelope uses for what the planner commands instead.
+    instruction_free_actions: ClassVar[str | None] = "the planned trajectory to the target_pose or target_joints goal"
 
     def __init__(
         self,

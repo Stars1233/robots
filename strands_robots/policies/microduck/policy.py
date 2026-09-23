@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 from numpy.typing import NDArray
@@ -229,6 +229,11 @@ class MicroduckPolicy(Policy):
 
     #: Proprioceptive locomotion - no cameras.
     requires_images = False
+    #: ``False``: the gait follows the velocity command, not language, so the
+    #: task envelopes say the instruction they echo was never read.
+    reads_instruction: ClassVar[bool] = False
+    #: The words the task envelope uses for what the gait commands instead.
+    instruction_free_actions: ClassVar[str | None] = "the gait commanded by the velocity inputs"
 
     def __init__(
         self,
