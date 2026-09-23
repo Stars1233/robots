@@ -58,7 +58,8 @@ policy = create_policy(
 )
 
 actions = policy.get_actions_sync(
-    observation_dict={"observation.state": [0.0] * 6},
+    # panda_arm's home keyframe; the zero pose starts in collision.
+    observation_dict={"observation.state": [0.0, 0.0, 0.0, -1.5708, 0.0, 1.5708, -0.7853]},
     instruction="reach for the red block",   # ignored by planners
     target_pose=[0.3, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0],   # [x,y,z, qw,qx,qy,qz]
 )
