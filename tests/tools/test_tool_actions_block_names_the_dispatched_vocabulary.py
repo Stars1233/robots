@@ -117,6 +117,40 @@ def named_actions(doc: str) -> frozenset[str] | None:
     return frozenset(match.group(1) for indent, match in candidates if indent == entry_indent)
 
 
+def _module_string_rosters(tree: ast.Module) -> dict[str, frozenset[str]]:
+    """Module-level names bound to a collection of string literals.
+
+    A tool that states its vocabulary once - ``_ACTIONS = ("status", ...)`` -
+    names every verb it answers there, so the constant is the roster even
+    though no comparison quotes the verbs.
+    """
+    rosters: dict[str, frozenset[str]] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign | ast.AnnAssign):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        value = node.value
+        if value is None:
+            continue
+        # frozenset({...}) / tuple([...]) wrap the literal group they build from.
+        if (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id in {"frozenset", "set", "tuple", "list"}
+            and value.args
+        ):
+            value = value.args[0]
+        if not isinstance(value, ast.Tuple | ast.List | ast.Set):
+            continue
+        literals = frozenset(e.value for e in value.elts if isinstance(e, ast.Constant) and isinstance(e.value, str))
+        if not literals:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                rosters[target.id] = literals
+    return rosters
+
+
 def dispatched_actions(tree: ast.Module) -> frozenset[str]:
     """Every string a module compares its ``action`` against.
 
@@ -125,9 +159,13 @@ def dispatched_actions(tree: ast.Module) -> frozenset[str]:
 
     Returns:
         The literals reached by ``action == "x"``, ``action in ("x", ...)`` and
-        ``match action: case "x"``. Compared by attribute suffix, so a local
-        ``action`` and a ``payload.action`` are both read.
+        ``match action: case "x"``, plus the members of a module-level roster a
+        membership test names: a tool that refuses everything outside
+        ``_ACTIONS`` and forwards the remainder to a delegate answers every verb
+        in that constant while quoting none of them. Compared by attribute
+        suffix, so a local ``action`` and a ``payload.action`` are both read.
     """
+    rosters = _module_string_rosters(tree)
     found: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Compare):
@@ -138,12 +176,13 @@ def dispatched_actions(tree: ast.Module) -> frozenset[str]:
                 if isinstance(operator, ast.Eq | ast.NotEq):
                     if isinstance(comparator, ast.Constant) and isinstance(comparator.value, str):
                         found.add(comparator.value)
-                elif isinstance(operator, ast.In | ast.NotIn) and isinstance(
-                    comparator, ast.Tuple | ast.List | ast.Set
-                ):
-                    for element in comparator.elts:
-                        if isinstance(element, ast.Constant) and isinstance(element.value, str):
-                            found.add(element.value)
+                elif isinstance(operator, ast.In | ast.NotIn):
+                    if isinstance(comparator, ast.Tuple | ast.List | ast.Set):
+                        for element in comparator.elts:
+                            if isinstance(element, ast.Constant) and isinstance(element.value, str):
+                                found.add(element.value)
+                    elif isinstance(comparator, ast.Name) and comparator.id in rosters:
+                        found |= rosters[comparator.id]
         elif isinstance(node, ast.Match) and ast.unparse(node.subject).endswith("action"):
             for case in node.cases:
                 for pattern in ast.walk(case.pattern):

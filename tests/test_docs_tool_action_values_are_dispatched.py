@@ -82,14 +82,49 @@ def _string_literals(node: ast.AST) -> set[str]:
     return set()
 
 
+def _module_string_rosters(tree: ast.Module) -> dict[str, set[str]]:
+    """Module-level names bound to a collection of string literals.
+
+    A tool that states its vocabulary once - ``_ACTIONS = ("status", ...)``,
+    refused with ``if action not in _ACTIONS`` - names every verb it answers in
+    that one constant, so the constant is the roster even though no comparison
+    quotes the verbs.
+    """
+    rosters: dict[str, set[str]] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign | ast.AnnAssign):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        value = node.value
+        if value is None:
+            continue
+        # frozenset({...}) / set([...]) wrap the literal group they are built from.
+        if isinstance(value, ast.Call) and isinstance(value.func, ast.Name):
+            if value.func.id in {"frozenset", "set", "tuple", "list"} and value.args:
+                value = value.args[0]
+        literals = _string_literals(value)
+        if not literals:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                rosters[target.id] = literals
+    return rosters
+
+
 def _dispatched_actions(source: Path) -> set[str]:
     """The action values ``source`` dispatches on.
 
     Reads both operand positions of a comparison against ``action`` so
     ``"list" == action`` counts, the collection of an ``action in (...)``
     membership test, and the patterns of a ``match action`` statement.
+
+    A comparison against a module-level roster contributes that roster: an
+    envelope that refuses everything outside ``_ACTIONS`` and forwards the
+    remainder to a delegate module dispatches every name in it, and quotes
+    none of them here.
     """
     tree = ast.parse(source.read_text(encoding="utf-8"))
+    rosters = _module_string_rosters(tree)
     found: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Compare):
@@ -97,6 +132,8 @@ def _dispatched_actions(source: Path) -> set[str]:
             if any(isinstance(o, ast.Name) and o.id == "action" for o in operands):
                 for operand in operands:
                     found |= _string_literals(operand)
+                    if isinstance(operand, ast.Name) and operand.id in rosters:
+                        found |= rosters[operand.id]
         if isinstance(node, ast.Match) and isinstance(node.subject, ast.Name) and node.subject.id == "action":
             for case in node.cases:
                 for pattern in ast.walk(case.pattern):
