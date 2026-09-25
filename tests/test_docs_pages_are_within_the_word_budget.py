@@ -46,7 +46,6 @@ _OVER_BUDGET = frozenset(
         "policies/cosmos3.md",
         "policies/kimodo.md",
         "policies/protomotions.md",
-        "policies/wbc.md",
         "reference/configuration.md",
         "robots/humanoids.md",
         "rosbridge-integration.md",
