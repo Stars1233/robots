@@ -14,6 +14,13 @@ So the four places the package triggers a clone all route through
 below grade that: each entry point is driven from two threads importing two
 descriptions whose imports report whether they overlapped, the scan pins that no
 fifth call site can skip the lock, and the two degraded conditions still import.
+
+A test module is the other half of the window: it reaches a description through
+its own ``pytest.importorskip("robot_descriptions.<name>")``, which no package
+seam sees, and a distributed run collects every file in every worker. So
+:mod:`tests.description_clone_lock` wraps ``clone_to_cache`` itself in *this*
+module's lock for the session, and the last two cells grade that the two halves
+wait on one lock file rather than on one each.
 """
 
 from __future__ import annotations
@@ -31,6 +38,7 @@ import pytest
 from strands_robots import _description_cache as dc
 from strands_robots.assets import download as dl
 from strands_robots.registry import discovery
+from tests.description_clone_lock import INSTALLED, serialize_description_clones
 
 # A description module whose *import* reports itself to the probe, the way a
 # real one clones while it is being imported.
@@ -50,6 +58,23 @@ _MJCF = '<mujoco model="probe"><worldbody><geom type="box" size="1 1 1"/></world
 
 #: Two descriptions, as two robots sharing one upstream repository would be.
 _NAMES = ("probealpha_mj_description", "probebeta_mj_description")
+
+# A description that clones the way a real one does: through the package's
+# ``_cache.clone_to_cache``, bound at import time - so once the session has
+# wrapped that name, the clone runs inside this module's lock.
+_CLONING_DESCRIPTION_BODY = """
+from robot_descriptions._cache import clone_to_cache as _clone_to_cache
+
+REPOSITORY_PATH = _clone_to_cache("probe_repository")
+MJCF_PATH = REPOSITORY_PATH
+"""
+
+_CACHE_BODY = """
+def clone_to_cache(description_name, commit=None):
+    return "/cache/" + description_name
+"""
+
+_CLONING_NAME = "probegamma_mj_description"
 
 
 class _Probe:
@@ -87,6 +112,8 @@ def probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Probe]:
     (package / "bot.xml").write_text(_MJCF)
     for name in _NAMES:
         (tmp_path / f"{name}.py").write_text(_DESCRIPTION_BODY)
+    (tmp_path / f"{_CLONING_NAME}.py").write_text(_CLONING_DESCRIPTION_BODY)
+    (tmp_path / "_cache.py").write_text(_CACHE_BODY)
 
     state = _Probe(package)
     module = ModuleType("_clone_probe")
@@ -99,7 +126,7 @@ def probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Probe]:
     parent = ModuleType("robot_descriptions")
     parent.__path__ = [str(tmp_path)]  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "robot_descriptions", parent)
-    for name in _NAMES:
+    for name in (*_NAMES, _CLONING_NAME, "_cache"):
         monkeypatch.delitem(sys.modules, f"robot_descriptions.{name}", raising=False)
     monkeypatch.setenv(dc.CACHE_ENV, str(tmp_path / "cache"))
     monkeypatch.setattr(discovery, "_DISCOVER_CACHE", {}, raising=False)
@@ -230,3 +257,87 @@ def test_a_cache_that_cannot_be_locked_still_imports(
     module: Any = dc.import_description(_NAMES[0])
 
     assert module.PACKAGE_PATH == probe.PACKAGE, f"{degraded}: the description did not import"
+
+
+def test_the_session_installs_the_clone_lock_once() -> None:
+    """conftest installed it, and installing again does not stack a second lock."""
+    cache = pytest.importorskip("robot_descriptions._cache")
+
+    assert getattr(cache.clone_to_cache, INSTALLED, False), (
+        "tests/conftest.py should have installed the clone lock for the session"
+    )
+    installed = cache.clone_to_cache
+    assert serialize_description_clones() is True
+    assert cache.clone_to_cache is installed, "a second install layered another lock over the same clone"
+
+
+def test_a_collecting_worker_waits_on_the_lock_a_package_caller_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One lock file for both halves: a lock each would clone into one directory together."""
+    cache = pytest.importorskip("robot_descriptions._cache")
+    monkeypatch.setenv(dc.CACHE_ENV, str(tmp_path / "cache"))
+    monkeypatch.setattr(cache, "clone_to_cache", lambda name, commit=None: f"/cache/{name}")
+    assert serialize_description_clones() is True
+    collecting = cache.clone_to_cache
+
+    cloned = threading.Event()
+
+    def collect() -> None:
+        collecting("mujoco_menagerie")
+        cloned.set()
+
+    worker = threading.Thread(target=collect)
+    with dc.clone_lock() as held:
+        assert held == dc.cache_dir() / dc.LOCK_NAME, f"the package locks {held}"
+        worker.start()
+        assert not cloned.wait(0.25), "a collecting worker cloned while a package caller held the lock"
+    worker.join(timeout=30)
+
+    assert cloned.is_set(), "the collecting worker never cloned once the lock was released"
+
+
+def test_a_description_that_clones_inside_the_import_does_not_wait_on_itself(probe: _Probe) -> None:
+    """The lock is re-entrant on its holder, so the session's wrapper cannot deadlock the package.
+
+    :func:`~strands_robots._description_cache.import_description` holds the lock
+    across the import, and a real description clones *during* that import
+    through ``_cache.clone_to_cache`` - which the session has wrapped in the
+    same lock. ``flock`` knows descriptors, not threads, so before the lock was
+    re-entrant the import parked on its own lock until ``pytest-timeout`` fired.
+    Run in a thread and bounded, so the pre-fix shape fails rather than hangs.
+    """
+    assert serialize_description_clones() is True
+    result: dict[str, object] = {}
+
+    def import_it() -> None:
+        module: Any = dc.import_description(_CLONING_NAME)
+        result["path"] = module.REPOSITORY_PATH
+
+    worker = threading.Thread(target=import_it, daemon=True)
+    worker.start()
+    worker.join(timeout=10)
+
+    assert not worker.is_alive(), "the import is waiting on the lock its own caller holds"
+    assert result == {"path": "/cache/probe_repository"}, f"the description imported as {result}"
+
+
+def test_the_lock_is_released_when_the_outermost_block_exits(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Re-entrancy is per thread and per lock file: a sibling still waits, and only until the holder is out."""
+    monkeypatch.setenv(dc.CACHE_ENV, str(tmp_path / "cache"))
+    acquired = threading.Event()
+
+    def sibling() -> None:
+        with dc.clone_lock():
+            acquired.set()
+
+    worker = threading.Thread(target=sibling, daemon=True)
+    with dc.clone_lock() as outer:
+        with dc.clone_lock() as inner:
+            assert inner == outer, "the nested block guards a different file"
+            worker.start()
+            assert not acquired.wait(0.25), "a sibling thread acquired the lock while this thread held it"
+        assert not acquired.wait(0.25), "the inner block released a lock the outer block still holds"
+    worker.join(timeout=30)
+
+    assert acquired.is_set(), "the sibling never acquired the lock once the outermost block exited"
