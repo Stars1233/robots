@@ -40,7 +40,6 @@ _OVER_BUDGET = frozenset(
     {
         "device-connect.md",
         "reference/configuration.md",
-        "simulation/domain-randomization.md",
     }
 )
 
