@@ -32,8 +32,10 @@ any of them:
 - **`set_joint_positions`** reads the live vector before writing so a partial dict
   updates only the DOFs it names. It refuses through the shared helper, placed after
   the robot resolves as `send_action`'s gate is, so a bad `robot_name` still reports
-  itself. Off the main thread this verb is queued onto the pump, which is how its
-  escape reached `run_pump_forever` too.
+  itself. That refusal is made when the call is made. Off the main thread the write is
+  queued onto the pump and applied on a later tick, so a view invalidated in between
+  was still read at drain time and could still end `run_pump_forever`; the drain-time
+  check is `4076-a-queued-write-checks-the-view-when-it-is-applied.md`.
 
 The trigger is ordinary shipped usage rather than an engineered race: a worker
 thread's `remove_object`, or `load_scene`'s per-episode reload, invalidates the view

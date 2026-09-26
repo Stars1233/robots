@@ -8834,10 +8834,37 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
             targets = {index_of[jn]: value for jn, value in coerced.items()}
 
             def _apply() -> None:
-                cur = list(r.articulation.get_joint_positions())
-                for dof, value in targets.items():
-                    cur[dof] = value
-                r.articulation.set_joint_positions(np.array(cur, dtype=float))
+                # Re-checked HERE, not only by the gate above. That gate runs when
+                # the call is made; a queued ``_apply`` runs later, on whichever
+                # pump tick drains it, and a worker's dynamic ``add_object`` /
+                # ``remove_object`` - or ``load_scene``'s per-episode reload - can
+                # invalidate the view in between. The read below is then the one
+                # ``remove_object`` measured hanging, and otherwise raises the bare
+                # ``Exception`` that ``pump`` step 1's narrow handler cannot catch,
+                # so it escaped onto the main thread and ended ``run_pump_forever``
+                # (#4076). Under ``self._lock`` because every write that marks the
+                # view stale is made under it, which makes the check and the read
+                # one step rather than a narrower window. An ``RLock``, so the
+                # main-thread path below re-enters it from inside the method's own
+                # ``with``.
+                with self._lock:
+                    if self._physics_view_stale:
+                        # The caller was already answered status="success" when
+                        # this was queued, so a log is the only place the drop can
+                        # be reported - WARNING, not the DEBUG step 1 uses for a
+                        # failed action, because nothing else will say it happened.
+                        logger.warning(
+                            "set_joint_positions(robot_name=%r): queued write dropped - a dynamic body "
+                            "was added or removed after it was queued, so PhysX's tensor view no longer "
+                            "covers the scene and the joint read would hang or raise. Call reset(), then "
+                            "set the pose again.",
+                            robot_name,
+                        )
+                        return
+                    cur = list(r.articulation.get_joint_positions())
+                    for dof, value in targets.items():
+                        cur[dof] = value
+                    r.articulation.set_joint_positions(np.array(cur, dtype=float))
 
             if self._on_main_thread():
                 _apply()

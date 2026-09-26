@@ -362,6 +362,139 @@ class TestSetJointPositionsRefusesAStaleView:
         assert "reset()" not in text
 
 
+class _DepthRLock:
+    """An ``RLock`` that reports how deeply it is held, so a read can say whether it
+    happened under the lock rather than a test inferring it from the source."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self.depth = 0
+
+    def __enter__(self) -> _DepthRLock:
+        self._lock.acquire()
+        self.depth += 1
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.depth -= 1
+        self._lock.release()
+
+
+def _queue_a_write_from_a_worker(engine: Any) -> dict[str, Any]:
+    """Call ``set_joint_positions`` off the main thread with a pump engaged, which is
+    the only path that puts ``_apply`` on the queue rather than running it inline."""
+    engine._pump_running = True
+    result: dict[str, Any] = {}
+
+    def _worker() -> None:
+        result.update(engine.set_joint_positions(robot_name="arm", positions={"j0": 0.1}))
+
+    worker = threading.Thread(target=_worker)
+    worker.start()
+    worker.join(timeout=10)
+    return result
+
+
+class TestAQueuedWriteChecksTheViewWhenItIsApplied:
+    """The gate in ``set_joint_positions`` runs when the call is MADE; a queued write
+    is APPLIED on a later pump tick, and a worker's dynamic ``add_object`` /
+    ``remove_object`` - or ``load_scene``'s per-episode reload - can invalidate the
+    view in between.
+
+    Pre-fix the drain performed the read regardless, so the bare ``Exception`` a
+    stale view raises escaped ``pump`` step 1's narrow handler and ended
+    ``run_pump_forever`` on the main thread - the escape #3343's changelog said was
+    closed (#4076). Every cell here goes stale AFTER the call returned
+    ``status="success"``, which is the ordering the call-time gate cannot see.
+    """
+
+    def test_the_call_is_answered_before_the_view_goes_stale(self) -> None:
+        """The premise: the write really was queued and answered as success, so the
+        call-time gate had nothing to refuse."""
+        engine = _engine(stale=False)
+
+        result = _queue_a_write_from_a_worker(engine)
+
+        assert result["status"] == "success"
+        assert "queued" in _text(result)
+        assert engine._action_q.qsize() == 1
+
+    def test_a_view_that_went_stale_is_not_read_or_written(self) -> None:
+        engine = _engine(stale=False)
+        _queue_a_write_from_a_worker(engine)
+        engine._physics_view_stale = True
+
+        engine.pump(render=False)
+
+        art = engine._robots["arm"].articulation
+        assert (art.reads, art.position_writes) == (0, [])
+
+    def test_the_backend_refusal_does_not_escape_the_pump(self) -> None:
+        """The failure mode end to end: an articulation that raises what a stale
+        view raises. Pre-fix this ``pump`` call raised on the main thread."""
+        engine = _engine(stale=False)
+        _queue_a_write_from_a_worker(engine)
+        engine._robots["arm"].articulation._raises = True
+        engine._physics_view_stale = True
+
+        engine.pump(render=False)  # must not raise
+
+        assert engine._action_q.empty(), "the dropped write was left in the queue"
+
+    def test_the_drop_is_reported(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The caller was already told success, so a WARNING is the only place the
+        drop can surface - and pump step 1 logs a failed action at DEBUG, which is
+        where a raise from the closure would have gone."""
+        engine = _engine(stale=False)
+        _queue_a_write_from_a_worker(engine)
+        engine._physics_view_stale = True
+
+        with caplog.at_level(logging.WARNING):
+            engine.pump(render=False)
+
+        dropped = [r for r in caplog.records if "queued write dropped" in r.getMessage()]
+        assert len(dropped) == 1
+        assert dropped[0].levelno == logging.WARNING
+        assert "reset()" in dropped[0].getMessage()
+        assert "'arm'" in dropped[0].getMessage()
+
+    def test_a_queued_write_still_lands_on_a_live_view(self) -> None:
+        """Control: the drain applies the write when nothing changed."""
+        engine = _engine(stale=False)
+        _queue_a_write_from_a_worker(engine)
+
+        engine.pump(render=False)
+
+        art = engine._robots["arm"].articulation
+        assert art.reads >= 1
+        assert art.position_writes, "a queued write on a live view was not applied"
+        assert list(art.position_writes[-1])[0] == pytest.approx(0.1)
+
+    def test_the_check_and_the_read_happen_under_the_lock(self) -> None:
+        """Every write that marks the view stale is made under ``self._lock``, so
+        holding it across the check and the read is what makes the two one step.
+        Without it a worker's dynamic add could land between them."""
+        engine = _engine(stale=False)
+        lock = _DepthRLock()
+        engine._lock = lock
+        depths: list[int] = []
+        art = engine._robots["arm"].articulation
+        real_read = art.get_joint_positions
+
+        def _recording_read() -> Any:
+            depths.append(lock.depth)
+            return real_read()
+
+        art.get_joint_positions = _recording_read  # type: ignore[method-assign]
+        _queue_a_write_from_a_worker(engine)
+        depths.clear()  # only the drain's read is under test
+
+        engine.pump(render=False)
+
+        assert depths, "the queued write never read the articulation"
+        assert depths[0] >= 1, "the queued write read the articulation without holding self._lock"
+
+
 class TestEveryArticulationTouchConsultsTheGate:
     """The sweep on the second axis, derived from the source.
 
@@ -411,38 +544,58 @@ class TestEveryArticulationTouchConsultsTheGate:
         assert len(sources) > 1, "the isaac package collapsed to one module; re-scope this sweep"
         return sources
 
+    @staticmethod
+    def _own_body_consults_the_gate(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+        """Whether ``func`` itself - not a function nested in it - reads the flag.
+
+        A read means an ``_physics_view_stale`` attribute load or a call to the shared
+        ``_physics_view_stale_error`` helper. Matching the name as text instead would
+        count a comment or a docstring that merely mentions the flag as a gate.
+        """
+        stack: list[ast.AST] = list(func.body)
+        while stack:
+            node = stack.pop()
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+                continue
+            if isinstance(node, ast.Attribute) and node.attr == "_physics_view_stale":
+                return True
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_physics_view_stale_error":
+                return True
+            stack.extend(ast.iter_child_nodes(node))
+        return False
+
     def _touching_scopes(self) -> dict[str, set[str]]:
         """``{innermost function name: ops it performs}`` for every tensor touch,
-        paired with whether any ENCLOSING scope consults the gate.
+        paired with whether THAT function's own body consults the gate.
 
-        The enclosing chain matters and is easy to get wrong: ``set_joint_positions``
-        performs its read inside a nested ``_apply`` closure, so a sweep that asked
-        only about the innermost function would have called it ungated even after
-        the outer method grew a gate.
+        Only the innermost scope's own check counts, and that is the part that is easy
+        to get wrong. An earlier form of this sweep credited any ENCLOSING scope, on
+        the reasoning that ``set_joint_positions`` gates its nested ``_apply``
+        closure. It does not: an enclosing check runs when the closure is BUILT,
+        and ``_apply`` is queued onto the pump and run on a later tick, by which time
+        a worker's dynamic add may have invalidated the view. So the enclosing form
+        reported ``_apply`` as gated while a queued write read a stale view and its
+        bare ``Exception`` ended ``run_pump_forever`` (#4076). A function that runs
+        immediately carries its own check here too, so this rule costs nothing for
+        the surfaces that were already right.
         """
         touched: dict[str, set[str]] = {}
         gated: set[str] = set()
         for path in self._sources():
-            source = path.read_text(encoding="utf-8")
-            lines = source.splitlines()
-            tree = ast.parse(source, filename=str(path))
-            funcs = sorted(
-                (node.lineno, node.end_lineno or node.lineno, node.name)
-                for node in ast.walk(tree)
-                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-            )
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            funcs = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)]
             for node in ast.walk(tree):
                 if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
                     continue
                 if node.func.attr not in self._OPS:
                     continue
-                chain = [f for f in funcs if f[0] <= node.lineno <= f[1]]
+                chain = [f for f in funcs if f.lineno <= node.lineno <= (f.end_lineno or f.lineno)]
                 if not chain:
                     continue
-                name = chain[-1][2]
-                touched.setdefault(name, set()).add(node.func.attr)
-                if any("_physics_view_stale" in "\n".join(lines[s - 1 : e]) for s, e, _ in chain):
-                    gated.add(name)
+                innermost = max(chain, key=lambda f: f.lineno)
+                touched.setdefault(innermost.name, set()).add(node.func.attr)
+                if self._own_body_consults_the_gate(innermost):
+                    gated.add(innermost.name)
         self._gated = gated
         return touched
 
@@ -471,11 +624,9 @@ class TestEveryArticulationTouchConsultsTheGate:
         exemption map instead of keeping its gate.
 
         ``_apply`` rather than ``set_joint_positions`` because that is the scope the
-        walk yields: the read lives in a nested closure, and it counts as gated only
-        because the walk credits an ENCLOSING scope's check. That is the case this
-        class's own docstring calls easy to get wrong, so it is the one pinned by
-        name - asserting on ``set_joint_positions`` here passes vacuously if the
-        closure is ever hoisted out, and fails spuriously today.
+        walk yields, and it now has to carry its own check: the closure is queued and
+        run on a later pump tick, so the method's check at call time does not cover
+        it (#4076). Pinned by name so the check cannot drift back up into the method.
         """
         self._touching_scopes()
 
