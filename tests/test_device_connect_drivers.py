@@ -102,11 +102,20 @@ class FakeDeviceStatus:
 mock_types.DeviceIdentity = FakeDeviceIdentity
 mock_types.DeviceStatus = FakeDeviceStatus
 
+# ``robot_mesh`` dispatch tests elsewhere in the suite patch
+# ``device_connect_agent_tools.connection.get_connection``, which imports the
+# real package (-> ``device_connect_edge.messaging``). Cache it now, while the
+# real edge is still in sys.modules, so the mock installed below cannot make
+# those tests depend on which file a worker collects first.
+try:
+    import device_connect_agent_tools.connection  # noqa: E402, F401
+except Exception:  # the [device-connect] extra is optional
+    pass
+
 # The swap has one owner (tests/_device_connect_real.py), which records only
-# what is real. Collected after test_device_connect_all_robots.py and before
-# that file tears down - the alphabetical order - the edge and integration
-# registered right now are that file's mocks and the modules bound to them, not
-# originals to hand back at teardown.
+# what is real: were another installing file collected ahead of this one, the
+# edge and integration registered right now would be that file's mocks and the
+# modules bound to them, not originals to hand back at teardown.
 _mocked_edge = use_a_mock_edge(
     {
         "device_connect_edge": mock_device_connect_edge,
@@ -125,8 +134,8 @@ from strands_robots.device_connect.robot_driver import RobotDeviceDriver  # noqa
 from strands_robots.device_connect.sim_driver import SimulationDeviceDriver  # noqa: E402
 
 
-# A sibling test module (test_device_connect_all_robots) mocks device_connect_edge
-# and, in its teardown_module, purges strands_robots.device_connect.* from
+# A test module that mocks device_connect_edge (this one does too) can, in its
+# teardown_module, purge strands_robots.device_connect.* from
 # sys.modules. Pytest collects every test module before running any teardown, so
 # by the time these tests RUN, sim_driver may no longer be the object in
 # sys.modules: SimulationDeviceDriver.execute still closes over its original
