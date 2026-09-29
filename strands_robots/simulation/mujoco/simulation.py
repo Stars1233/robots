@@ -61,6 +61,7 @@ real guard when the verb is called directly as a Python API.
 
 import atexit
 import contextlib
+import copy
 import functools
 import inspect
 import json
@@ -1024,6 +1025,17 @@ class MuJoCoSimEngine(
         # Future's done-callback and read by ``_rollouts_ended_in_error``.
         # Replaced when that robot's next rollout is submitted.
         self._rollout_failures: dict[str, str] = {}
+        # The envelope the last start_policy rollout per robot ended with,
+        # success or error, recorded by the same done-callback and read by
+        # ``policy_result`` and ``stop_policy`` (#4162). Cleared when that
+        # robot's next rollout is submitted, so a stale report never reads as
+        # the current one.
+        self._rollout_results: dict[str, dict[str, Any]] = {}
+        # Robots whose kept report a stop_policy has already answered for: the
+        # stop that halted the rollout (its verdict is the answer), or the first
+        # stop after it ended on its own. A later stop is a bare "Was not
+        # running"; ``policy_result`` still reads the report.
+        self._rollout_reported: set[str] = set()
         # Capture rate of each rollout in ``_policy_threads``, recorded where
         # the Future is tracked so it is readable from another thread the
         # instant ``start_policy`` returns (``start_recording`` compares against
@@ -6917,6 +6929,8 @@ class MuJoCoSimEngine(
         # in a Future nobody reads and "No policies running." is the same
         # reading as a rollout that completed.
         self._rollout_failures.pop(robot_name, None)
+        self._rollout_results.pop(robot_name, None)
+        self._rollout_reported.discard(robot_name)
         future.add_done_callback(functools.partial(self._record_rollout_outcome, robot_name, policy_provider))
 
         return {
@@ -6925,12 +6939,20 @@ class MuJoCoSimEngine(
         }
 
     def _record_rollout_outcome(self, robot_name: str, policy_provider: str, future: Future) -> None:
-        """Done-callback of a ``start_policy`` worker: keep a failure where a caller can read it."""
+        """Done-callback of a ``start_policy`` worker: keep its report where a caller can read it.
+
+        The finished envelope, success or error, lands in ``_rollout_results``
+        for :meth:`policy_result` and :meth:`stop_policy`; a failure's reason
+        additionally lands in ``_rollout_failures`` for the in-flight listing.
+        """
         exc = future.exception()
         if exc is not None:
             reason = f"{type(exc).__name__}: {exc}"
+            self._rollout_results[robot_name] = {"status": "error", "content": [{"text": reason}]}
         else:
             result = future.result()
+            if isinstance(result, dict):
+                self._rollout_results[robot_name] = result
             if not (isinstance(result, dict) and result.get("status") == "error"):
                 return
             content = result.get("content") or [{}]
@@ -6942,6 +6964,15 @@ class MuJoCoSimEngine(
 
     def _rollouts_ended_in_error(self) -> Mapping[str, str]:
         return dict(self._rollout_failures)
+
+    def policy_result(self, robot_name: str) -> dict[str, Any] | None:
+        """The envelope the last completed ``start_policy`` rollout on ``robot_name`` returned.
+
+        ``None`` while the rollout is in flight or when none has completed
+        since the engine was built; see :meth:`SimEngine.policy_result`.
+        """
+        result = self._rollout_results.get(robot_name)
+        return copy.deepcopy(result) if result is not None else None
 
     def _make_recording_on_frame(self, robot_name: str, instruction: str) -> Any:
         """MuJoCo override: the recording half of the rollout hook, on its own.
@@ -8223,13 +8254,23 @@ class MuJoCoSimEngine(
         # reads means "the loop is no longer running", which is TRUE for the
         # nothing-to-stop case. This one is False there. Two keys spelled alike
         # and opposite on that case is the drift worth spending a word to avoid.
-        return {
-            "status": "success",
-            "content": [
-                {"text": msg},
-                {"json": {"robot": robot_name, "was_running": was_running, "exited": exited}},
-            ],
-        }
+        # The report of a rollout that ended on its own travels with the verdict:
+        # it is the only place a start_policy tool caller can read what
+        # run_policy would have returned (#4162). Only the first stop after
+        # that carries it: a stop
+        # that halted the rollout already answers for it, and so does any stop
+        # after the first, so the halting, idle and repeat envelopes stay exactly
+        # what they were (stand-ins and peers pin them).
+        verdict: dict[str, Any] = {"robot": robot_name, "was_running": was_running, "exited": exited}
+        last_result = None if was_running or robot_name in self._rollout_reported else self.policy_result(robot_name)
+        self._rollout_reported.add(robot_name)
+        if last_result is not None:
+            first_line = str((last_result.get("content") or [{}])[0].get("text", "")).splitlines()[:1]
+            msg += f"\nLast rollout on '{robot_name}' ended {last_result.get('status')}" + (
+                f": {first_line[0]}" if first_line else ""
+            )
+            verdict["last_result"] = last_result
+        return {"status": "success", "content": [{"text": msg}, {"json": verdict}]}
 
     # Cleanup
 
