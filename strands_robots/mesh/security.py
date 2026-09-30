@@ -382,6 +382,8 @@ _LEROBOT_POLICY_FAMILIES: frozenset[str] = frozenset(
         "pi0fast",
         "smolvla",
         "sac",
+        # GR00T N1.7, lerobot's native port (``lerobot_local`` policy_type).
+        "groot",
     }
 )
 
@@ -405,8 +407,6 @@ _REGISTRY_POLICY_PROVIDERS: frozenset[str] = frozenset(
         "mock",
         "random",
         "test",
-        # Gr00tPolicy
-        "groot",
         # LerobotLocalPolicy
         "lerobot_local",
         "lerobot",
